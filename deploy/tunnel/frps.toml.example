@@ -1,0 +1,21 @@
+bindAddr = "0.0.0.0"
+bindPort = 24444
+
+transport.tls.force = true
+
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/etc/native-mac-rdp/frp-token"
+
+# Keep the FRP control port and the selected RDP TCP port open in the host
+# firewall/security group. Reliable UDP is not part of this template.
+allowPorts = [
+  { single = 43393 }
+]
+
+log.to = "/var/log/native-mac-rdp-frp/frps.log"
+log.level = "info"
+log.maxDays = 7
+log.disablePrintColor = true
+
+detailedErrorsToClient = false

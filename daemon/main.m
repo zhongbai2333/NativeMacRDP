@@ -8,7 +8,6 @@
 #import <unistd.h>
 #import "daemon/RDPServer.h"
 #import "daemon/RDPSession.h"
-#import "daemon/AutoUpdate.h"
 #define RDP_LOG_COMPONENT "main"
 #include "logging/RDPLog.h"
 
@@ -48,6 +47,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
         "  --port <n>            TCP port to listen on (default: 3389)\n"
+        "  --bind-address <addr> listen address (default: 127.0.0.1)\n"
         "  --log-level <l>       error|info|verbose|debug (default: info)\n"
         "  --check-permissions   report Screen Recording + Accessibility state, then exit\n",
         prog);
@@ -65,9 +65,12 @@ int main(int argc, char *argv[]) {
         if (!getenv("TMPDIR")) setenv("TMPDIR", "/var/tmp", 1);
 
         uint16_t port = 3389;
+        NSString *bindAddress = @"127.0.0.1";
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
                 port = (uint16_t)atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--bind-address") == 0 && i + 1 < argc) {
+                bindAddress = [NSString stringWithUTF8String:argv[++i]];
             } else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
                 int lvl = rdp_log_level_from_string(argv[++i]);
                 if (lvl >= 0) rdp_log_set_level((RDPLogLevel)lvl);
@@ -101,16 +104,18 @@ int main(int argc, char *argv[]) {
         kevent(kq, kev, 2, NULL, 0, NULL);
 
         AppDelegate *delegate = [[AppDelegate alloc] init];
-        RDPServer *server = [[RDPServer alloc] initWithPort:port];
+        RDPServer *server = [[RDPServer alloc] initWithPort:port
+                                               bindAddress:bindAddress];
         server.delegate = delegate;
 
         NSError *error = nil;
         if (![server startWithError:&error]) {
-            rdp_error("failed to start server on port %u: %s",
-                      port, error.localizedDescription.UTF8String);
+            rdp_error("failed to start server on %s:%u: %s",
+                      bindAddress.UTF8String, port,
+                      error.localizedDescription.UTF8String);
             return 1;
         }
-        rdp_info("listening on port %u", port);
+        rdp_info("listening on %s:%u", bindAddress.UTF8String, port);
 
         /* Keep the system from idle-sleeping while the daemon is loaded, so an
          * open-lid Mac stays reachable on the LAN / Tailscale even when the user
@@ -135,10 +140,8 @@ int main(int argc, char *argv[]) {
                           "Mac may sleep and become unreachable", ar);
         }
 
-        /* Start the silent self-updater (no-op if RDP_UPDATE_ENABLED=0). It
-         * runs entirely on its own background serial queue + dispatch timer —
-         * it never touches the main thread (which is about to park in kevent). */
-        [AutoUpdate start];
+        /* Hardened build: there is deliberately no self-update code in the
+         * binary. Updates are staged, reviewed, rebuilt and installed manually. */
 
         /* Spin the run loop on a background thread so CFRunLoop/dispatch works,
            while this thread blocks on kqueue — zero CPU until a signal arrives. */

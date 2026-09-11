@@ -1,0 +1,25 @@
+# NativeMacRDP client-side FRP profile for the supported TCP-only deployment.
+# Replace placeholders and choose a public port permitted by the FRP server.
+serverAddr = "YOUR_FRP_SERVER"
+serverPort = 24444
+loginFailExit = false
+
+transport.tls.enable = true
+
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/absolute/path/to/frpc-token"
+
+log.to = "/absolute/path/to/frpc-native-mac-rdp.log"
+log.level = "info"
+log.maxDays = 7
+log.disablePrintColor = true
+
+[[proxies]]
+name = "native-mac-rdp-tcp"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 3391
+remotePort = 43393
+transport.useEncryption = false
+transport.useCompression = false

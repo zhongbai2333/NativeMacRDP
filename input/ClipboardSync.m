@@ -45,10 +45,49 @@
     _lastChangeCount = cc;
 
     ClipboardSendBlock block = self.sendToClientBlock;
-    if (!block) return;
+    ClipboardSendFilesBlock filesBlock = self.sendFilesToClientBlock;
+    if (!block && !filesBlock) return;
+
+    /* Finder places file URLs on the pasteboard alongside string-compatible
+     * representations of their paths. Detect files before text, otherwise
+     * stringForType: turns a copied file into plain path text and CLIPRDR never
+     * gets the stream-backed FileGroupDescriptorW format it needs. */
+    if (filesBlock) {
+        NSDictionary *options = @{
+            NSPasteboardURLReadingFileURLsOnlyKey: @YES
+        };
+        NSArray<NSURL *> *urls = [pb readObjectsForClasses:@[ NSURL.class ]
+                                                   options:options];
+        NSMutableArray<NSString *> *paths =
+            [NSMutableArray arrayWithCapacity:urls.count];
+        for (NSURL *url in urls) {
+            if (url.isFileURL && url.path.length > 0)
+                [paths addObject:url.path];
+        }
+
+        /* Finder and some older Cocoa applications still publish the legacy
+         * filename-list representation without a readable public.file-url. */
+        if (paths.count == 0) {
+            id legacy = [pb propertyListForType:@"NSFilenamesPboardType"];
+            if ([legacy isKindOfClass:NSArray.class]) {
+                for (id value in (NSArray *)legacy) {
+                    if ([value isKindOfClass:NSString.class] &&
+                        [(NSString *)value length] > 0)
+                        [paths addObject:value];
+                }
+            }
+        }
+
+        if (paths.count > 0) {
+            rdp_info("Mac clipboard changed: detected %zu file(s)",
+                     (size_t)paths.count);
+            filesBlock(paths);
+            return;
+        }
+    }
 
     NSString *str = [pb stringForType:NSPasteboardTypeString];
-    if (str) {
+    if (str && block) {
         NSData *utf16 = [str dataUsingEncoding:NSUTF16LittleEndianStringEncoding];
         if (utf16) {
             /* MS-RDPECLIP: CF_UNICODETEXT data is expected to be NUL-terminated.
@@ -65,7 +104,7 @@
         return;
     }
     NSData *png = [pb dataForType:NSPasteboardTypePNG];
-    if (png) {
+    if (png && block) {
         rdp_verbose("clipboard: Mac copy -> %zu PNG bytes to client", (size_t)png.length);
         block((const uint8_t *)png.bytes, png.length, RDP_CB_FORMAT_PNG);
     }
@@ -104,6 +143,30 @@
         _lastChangeCount = pb.changeCount;
         rdp_verbose("clipboard: received %zu bytes from client (PNG)", len);
     }
+}
+
+- (BOOL)receiveFilesFromClientPaths:(const char *const *)paths
+                              count:(size_t)count {
+    if (!paths || count == 0) return NO;
+
+    NSMutableArray<NSURL *> *urls =
+        [NSMutableArray arrayWithCapacity:count];
+    for (size_t i = 0; i < count; i++) {
+        if (!paths[i] || !paths[i][0]) return NO;
+        NSString *path = [NSString stringWithUTF8String:paths[i]];
+        if (!path) return NO;
+        [urls addObject:[NSURL fileURLWithPath:path isDirectory:NO]];
+    }
+
+    NSPasteboard *pb = NSPasteboard.generalPasteboard;
+    [pb clearContents];
+    if (![pb writeObjects:urls]) {
+        rdp_error("clipboard: failed to publish %zu downloaded file(s)", count);
+        return NO;
+    }
+    _lastChangeCount = pb.changeCount;  /* do not advertise the staged files back */
+    rdp_info("Windows clipboard ready: published %zu file(s) to Finder", count);
+    return YES;
 }
 
 @end

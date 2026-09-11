@@ -1,0 +1,59 @@
+diff --git a/include/freerdp/codec/progressive.h b/include/freerdp/codec/progressive.h
+--- a/include/freerdp/codec/progressive.h
++++ b/include/freerdp/codec/progressive.h
+@@ -65,6 +65,16 @@ extern "C"
+ 	WINPR_ATTR_NODISCARD
+ 	FREERDP_API BOOL progressive_context_reset(PROGRESSIVE_CONTEXT* WINPR_RESTRICT progressive);
+ 
++	/** Override the RemoteFX quantization tables used by the Progressive
++	 * encoder. Values use the protocol range 6..15 in LL3..HH1 order. Pass one
++	 * table (10 values) for a shared Y/Cb/Cr table, or three consecutive tables
++	 * (30 values) for independent Y, Cb, and Cr quantization. This is a private
++	 * server extension used for motion-adaptive TCP quality. */
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL progressive_context_set_quantization(
++	    PROGRESSIVE_CONTEXT* WINPR_RESTRICT progressive,
++	    const UINT32* WINPR_RESTRICT values, size_t count);
++
+ 	FREERDP_API void progressive_context_free(PROGRESSIVE_CONTEXT* progressive);
+ 
+ 	WINPR_ATTR_MALLOC(progressive_context_free, 1)
+diff --git a/libfreerdp/codec/progressive.c b/libfreerdp/codec/progressive.c
+--- a/libfreerdp/codec/progressive.c
++++ b/libfreerdp/codec/progressive.c
+@@ -2629,6 +2629,35 @@ BOOL progressive_context_reset(PROGRESSIVE_CONTEXT* WINPR_RESTRICT progressive)
+ 	return (progressive != nullptr);
+ }
+ 
++BOOL progressive_context_set_quantization(PROGRESSIVE_CONTEXT* WINPR_RESTRICT progressive,
++                                           const UINT32* WINPR_RESTRICT values,
++                                           size_t count)
++{
++	if (!progressive || !progressive->Compressor || !progressive->rfx_context || !values ||
++	    ((count != NR_QUANT_VALUES) && (count != (3u * NR_QUANT_VALUES))))
++		return FALSE;
++
++	for (size_t index = 0; index < count; index++)
++	{
++		if (values[index] < 6u || values[index] > 15u)
++			return FALSE;
++	}
++
++	UINT32* quants = (UINT32*)winpr_aligned_malloc(count * sizeof(UINT32), 32);
++	if (!quants)
++		return FALSE;
++	CopyMemory(quants, values, count * sizeof(UINT32));
++
++	RFX_CONTEXT* rfx = progressive->rfx_context;
++	winpr_aligned_free(rfx->quants);
++	rfx->quants = quants;
++	rfx->numQuant = (BYTE)(count / NR_QUANT_VALUES);
++	rfx->quantIdxY = 0;
++	rfx->quantIdxCb = (rfx->numQuant == 3u) ? 1u : 0u;
++	rfx->quantIdxCr = (rfx->numQuant == 3u) ? 2u : 0u;
++	return TRUE;
++}
++
+ PROGRESSIVE_CONTEXT* progressive_context_new(BOOL Compressor)
+ {
+ 	return progressive_context_new_ex(Compressor, 0);

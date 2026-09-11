@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible NativeMacRDP problem.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not post credentials, certificates, tunnel tokens, public server addresses, full home paths, or unredacted logs. Security issues belong in a private advisory.
+  - type: input
+    id: mac
+    attributes:
+      label: Mac and macOS
+      description: Mac model/architecture and exact macOS version.
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: RDP client
+      description: Client name, operating system, and version.
+    validations:
+      required: true
+  - type: dropdown
+    id: path
+    attributes:
+      label: Connection path
+      options:
+        - Loopback
+        - LAN
+        - VPN
+        - Authenticated tunnel
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Include resolution, optional channels, and the smallest reliable sequence.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs
+      description: Paste only the short relevant excerpt after removing sensitive values.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I checked the current feature status and existing issues.
+          required: true
+        - label: I removed credentials, addresses, certificates, and personal paths.
+          required: true

@@ -31,6 +31,10 @@ NS_ASSUME_NONNULL_BEGIN
                      sourceHeight:(uint32_t)sourceHeight;
 
 - (void)injectKeyEvent:(uint16_t)flags scanCode:(uint16_t)code;
+- (void)injectUnicodeKeyEvent:(uint16_t)flags codeUnit:(uint16_t)codeUnit;
+/* Release modifier keys whose key-up PDU may have been lost while the mobile
+ * client changed focus, opened its software keyboard, or reconnected. */
+- (void)resetKeyboardState;
 - (void)injectMouseEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;
 /* Wheel rotation is encoded entirely within flags; decoded internally. */
 - (void)injectMouseWheelEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;

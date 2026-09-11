@@ -1,0 +1,508 @@
+diff --git a/include/freerdp/peer.h b/include/freerdp/peer.h
+--- a/include/freerdp/peer.h
++++ b/include/freerdp/peer.h
+@@ -91,6 +91,15 @@ extern "C"
+ 	typedef BOOL (*psPeerAdjustMonitorsLayout)(freerdp_peer* peer);
+ 	typedef BOOL (*psPeerClientCapabilities)(freerdp_peer* peer);
+ 
++	/* Private-server extension used by the macOS RDP UDP transport.  FreeRDP
++	 * creates the MS-RDPEMT request ID and 16-byte cookie internally; the UDP
++	 * listener needs the exact values to bind an incoming RDPUDP SYN to this
++	 * authenticated TCP peer. */
++	typedef BOOL (*psPeerMultitransportBootstrap)(freerdp_peer* peer, UINT32 requestId,
++	                                              const BYTE* securityCookie,
++	                                              size_t securityCookieLength,
++	                                              void* userData);
++
+ 	typedef BOOL (*psPeerSendChannelData)(freerdp_peer* peer, UINT16 channelId, const BYTE* data,
+ 	                                      size_t size);
+ 	typedef BOOL (*psPeerSendChannelPacket)(freerdp_peer* client, UINT16 channelId,
+@@ -233,6 +242,10 @@ extern "C"
+ 	WINPR_ATTR_NODISCARD
+ 	FREERDP_API const char* freerdp_peer_os_minor_type_string(freerdp_peer* client);
+ 
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL freerdp_peer_set_multitransport_bootstrap_handler(
++	    freerdp_peer* client, psPeerMultitransportBootstrap callback, void* userData);
++
+ 	FREERDP_API void freerdp_peer_free(freerdp_peer* client);
+ 
+ 	WINPR_ATTR_MALLOC(freerdp_peer_free, 1)
+diff --git a/include/freerdp/channels/wtsvc.h b/include/freerdp/channels/wtsvc.h
+--- a/include/freerdp/channels/wtsvc.h
++++ b/include/freerdp/channels/wtsvc.h
+@@ -54,6 +54,7 @@ extern "C"
+ 
+ 	typedef BOOL (*psDVCCreationStatusCallback)(void* userdata, UINT32 channelId,
+ 	                                            INT32 creationStatus);
++	typedef BOOL (*psDVCTunnelSendCallback)(void* userdata, const BYTE* data, UINT32 length);
+ 
+ 	/**
+ 	 * WTSVirtualChannelManager functions are FreeRDP extensions to the API.
+@@ -85,6 +86,24 @@ extern "C"
+ 	                                                                psDVCCreationStatusCallback cb,
+ 	                                                                void* userdata);
+ 
++	/* Private server-side MS-RDPEDYC Soft-Sync hooks.  They intentionally live on
++	 * the VCM so DRDYNVC parsing remains shared between TCP and the RDPEMT tunnel. */
++	FREERDP_API void WTSVirtualChannelManagerSetDVCTunnelCallback(
++	    HANDLE hServer, psDVCTunnelSendCallback cb, void* userdata);
++
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL WTSVirtualChannelManagerStartSoftSync(HANDLE hServer, UINT32 tunnelType,
++	                                                       const UINT32* channelIds,
++	                                                       size_t channelCount);
++
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL WTSVirtualChannelManagerReceiveDVCTunnelData(HANDLE hServer,
++	                                                             const BYTE* data,
++	                                                             UINT32 length);
++
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL WTSVirtualChannelManagerIsSoftSyncActive(HANDLE hServer);
++
+ 	/**
+ 	 * Extended FreeRDP WTS functions for channel handling
+ 	 */
+diff --git a/libfreerdp/core/multitransport.h b/libfreerdp/core/multitransport.h
+--- a/libfreerdp/core/multitransport.h
++++ b/libfreerdp/core/multitransport.h
+@@ -40,6 +40,10 @@ typedef state_run_t (*MultiTransportRequestCb)(rdpMultitransport* multi, UINT32 r
+                                                UINT16 reqProto, const BYTE* cookie);
+ typedef state_run_t (*MultiTransportResponseCb)(rdpMultitransport* multi, UINT32 reqId,
+                                                 UINT32 hrResponse);
++typedef BOOL (*MultiTransportBootstrapCb)(freerdp_peer* peer, UINT32 requestId,
++                                          const BYTE* securityCookie,
++                                          size_t securityCookieLength,
++                                          void* userData);
+ 
+ #define RDPUDP_COOKIE_LEN 16
+ #define RDPUDP_COOKIE_HASHLEN 32
+@@ -54,5 +58,8 @@ WINPR_ATTR_NODISCARD
+ FREERDP_LOCAL state_run_t multitransport_server_request(rdpMultitransport* multi, UINT16 reqProto);
+ 
++FREERDP_LOCAL BOOL multitransport_set_bootstrap_handler(
++    rdpMultitransport* multi, MultiTransportBootstrapCb callback, void* userData);
++
+ WINPR_ATTR_NODISCARD
+ FREERDP_LOCAL state_run_t multitransport_recv_response(rdpMultitransport* multi, wStream* s);
+ 
+diff --git a/libfreerdp/core/multitransport.c b/libfreerdp/core/multitransport.c
+--- a/libfreerdp/core/multitransport.c
++++ b/libfreerdp/core/multitransport.c
+@@ -37,6 +37,8 @@ struct rdp_multitransport
+ 
+ 	BYTE reliableCookie[RDPUDP_COOKIE_LEN];
+ 	BYTE reliableCookieHash[RDPUDP_COOKIE_HASHLEN];
++	MultiTransportBootstrapCb Bootstrap;
++	void* BootstrapUserData;
+ };
+ 
+ enum
+@@ -128,6 +130,19 @@ state_run_t multitransport_server_request(rdpMultitransport* multi, UINT16 reqPro
+ 		multi->reliableReqId = reqId++;
+ 		if (winpr_RAND(multi->reliableCookie, sizeof(multi->reliableCookie)) < 0)
+ 			return STATE_RUN_FAILED;
++		if (!multi->Bootstrap)
++		{
++			WLog_ERR(TAG, "UDP multitransport advertised without a bootstrap handler");
++			return STATE_RUN_FAILED;
++		}
++		freerdp_peer* peer = multi->rdp->context->peer;
++		if (!peer ||
++		    !multi->Bootstrap(peer, multi->reliableReqId, multi->reliableCookie,
++		                      sizeof(multi->reliableCookie), multi->BootstrapUserData))
++		{
++			WLog_ERR(TAG, "UDP multitransport bootstrap handler rejected request");
++			return STATE_RUN_FAILED;
++		}
+ 
+ 		return multitransport_request_send(multi, multi->reliableReqId, reqProto,
+ 		                                   multi->reliableCookie)
+@@ -139,6 +154,17 @@ state_run_t multitransport_server_request(rdpMultitransport* multi, UINT16 reqPro
+ 	return STATE_RUN_CONTINUE;
+ }
+ 
++BOOL multitransport_set_bootstrap_handler(rdpMultitransport* multi,
++                                          MultiTransportBootstrapCb callback,
++                                          void* userData)
++{
++	if (!multi)
++		return FALSE;
++	multi->Bootstrap = callback;
++	multi->BootstrapUserData = userData;
++	return TRUE;
++}
++
+ BOOL multitransport_client_send_response(rdpMultitransport* multi, UINT32 reqId, HRESULT hr)
+ {
+ 	WINPR_ASSERT(multi);
+diff --git a/libfreerdp/core/peer.c b/libfreerdp/core/peer.c
+--- a/libfreerdp/core/peer.c
++++ b/libfreerdp/core/peer.c
+@@ -1458,6 +1458,17 @@ const char* freerdp_peer_os_minor_type_string(freerdp_peer* client)
+ 	return os_minor_type_to_string((UINT16)osMinorType);
+ }
+ 
++BOOL freerdp_peer_set_multitransport_bootstrap_handler(
++    freerdp_peer* client, psPeerMultitransportBootstrap callback, void* userData)
++{
++	if (!client || !client->context || !client->context->rdp ||
++	    !client->context->rdp->multitransport)
++		return FALSE;
++	return multitransport_set_bootstrap_handler(client->context->rdp->multitransport,
++	                                            (MultiTransportBootstrapCb)callback,
++	                                            userData);
++}
++
+ freerdp_peer* freerdp_peer_new(int sockfd)
+ {
+ 	freerdp_peer* client = (freerdp_peer*)calloc(1, sizeof(freerdp_peer));
+diff --git a/libfreerdp/core/server.h b/libfreerdp/core/server.h
+--- a/libfreerdp/core/server.h
++++ b/libfreerdp/core/server.h
+@@ -64,6 +64,8 @@ struct rdp_peer_channel
+ 	wMessageQueue* queue;
+ 
+ 	BYTE dvc_open_state;
++	BOOL dvc_udp_selected;
++	BOOL dvc_udp_active;
+ 	INT32 creationStatus;
+ 	UINT32 dvc_total_length;
+ 	rdpMcsChannel* mcsChannel;
+@@ -87,6 +89,11 @@ struct WTSVirtualChannelManager
+ 
+ 	WINPR_ATTR_NODISCARD psDVCCreationStatusCallback dvc_creation_status;
+ 	void* dvc_creation_status_userdata;
++	WINPR_ATTR_NODISCARD psDVCTunnelSendCallback dvc_tunnel_send;
++	void* dvc_tunnel_send_userdata;
++	UINT32 dvc_soft_sync_tunnel_type;
++	BOOL dvc_soft_sync_pending;
++	BOOL dvc_soft_sync_active;
+ 
+ 	wHashTable* dynamicVirtualChannels;
+ };
+diff --git a/libfreerdp/core/server.c b/libfreerdp/core/server.c
+--- a/libfreerdp/core/server.c
++++ b/libfreerdp/core/server.c
+@@ -76,6 +76,42 @@ static rdpPeerChannel* wts_get_dvc_channel_by_id(WTSVirtualChannelManager* vcm,
+ 	return HashTable_GetItemValue(vcm->dynamicVirtualChannels, &ChannelId);
+ }
+ 
++static void wts_set_selected_dvc_active(WTSVirtualChannelManager* vcm, BOOL active,
++                                        BOOL clearSelection)
++{
++	ULONG_PTR* keys = nullptr;
++	const size_t count = HashTable_GetKeys(vcm->dynamicVirtualChannels, &keys);
++	for (size_t index = 0; index < count; index++)
++	{
++		const UINT32* channelId = (const UINT32*)keys[index];
++		rdpPeerChannel* dvc = channelId ? wts_get_dvc_channel_by_id(vcm, *channelId) : nullptr;
++		if (dvc && dvc->dvc_udp_selected)
++		{
++			dvc->dvc_udp_active = active;
++			if (clearSelection)
++				dvc->dvc_udp_selected = FALSE;
++		}
++	}
++	free(keys);
++}
++
++static void wts_clear_dvc_udp_state(WTSVirtualChannelManager* vcm)
++{
++	ULONG_PTR* keys = nullptr;
++	const size_t count = HashTable_GetKeys(vcm->dynamicVirtualChannels, &keys);
++	for (size_t index = 0; index < count; index++)
++	{
++		const UINT32* channelId = (const UINT32*)keys[index];
++		rdpPeerChannel* dvc = channelId ? wts_get_dvc_channel_by_id(vcm, *channelId) : nullptr;
++		if (dvc)
++		{
++			dvc->dvc_udp_selected = FALSE;
++			dvc->dvc_udp_active = FALSE;
++		}
++	}
++	free(keys);
++}
++
+ static BOOL wts_queue_receive_data(rdpPeerChannel* channel, const BYTE* Buffer1, UINT32 Length1,
+                                    const BYTE* Buffer2, UINT32 Length2)
+ {
+@@ -376,9 +412,37 @@ static BOOL wts_read_drdynvc_pdu(rdpPeerChannel* channel)
+ 				break;
+ 
+ 			case SOFT_SYNC_RESPONSE_PDU:
+-				WLog_ERR(TAG, "SoftSync response not handled yet(and rather strange to receive "
+-				              "that packet as our code doesn't send SoftSync requests");
++			{
++				WTSVirtualChannelManager* vcm = channel->vcm;
++				if (!vcm->dvc_soft_sync_pending || length < 5)
++				{
++					WLog_WARN(TAG, "unexpected or truncated SoftSync response");
++					return FALSE;
++				}
++
++				Stream_Seek_UINT8(channel->receiveData); /* Pad */
++				UINT32 numberOfTunnels = 0;
++				Stream_Read_UINT32(channel->receiveData, numberOfTunnels);
++				if (numberOfTunnels > (length - 5) / 4)
++					return FALSE;
++
++				BOOL accepted = FALSE;
++				for (UINT32 index = 0; index < numberOfTunnels; index++)
++				{
++					UINT32 tunnelType = 0;
++					Stream_Read_UINT32(channel->receiveData, tunnelType);
++					if (tunnelType == vcm->dvc_soft_sync_tunnel_type)
++						accepted = TRUE;
++				}
++
++				wts_set_selected_dvc_active(vcm, accepted, !accepted);
++				vcm->dvc_soft_sync_pending = FALSE;
++				vcm->dvc_soft_sync_active = accepted;
++				WLog_INFO(TAG, "SoftSync tunnel 0x%08" PRIx32 " %s",
++				          vcm->dvc_soft_sync_tunnel_type,
++				          accepted ? "accepted" : "rejected");
+ 				break;
++			}
+ 
+ 			case SOFT_SYNC_REQUEST_PDU:
+ 				WLog_ERR(TAG, "Not expecting a SoftSyncRequest on the server");
+@@ -448,6 +512,23 @@ static BOOL wts_read_drdynvc_pdu(rdpPeerChannel* channel)
+ 	return TRUE;
+ }
+ 
++static BOOL wts_send_drdynvc_pdu(rdpPeerChannel* dvc, const BYTE* data, UINT32 length)
++{
++	WINPR_ASSERT(dvc);
++	WINPR_ASSERT(dvc->vcm);
++	WTSVirtualChannelManager* vcm = dvc->vcm;
++	if (dvc->dvc_udp_active)
++	{
++		if (!vcm->dvc_soft_sync_active || !vcm->dvc_tunnel_send)
++			return FALSE;
++		return vcm->dvc_tunnel_send(vcm->dvc_tunnel_send_userdata, data, length);
++	}
++
++	ULONG written = 0;
++	return WTSVirtualChannelWrite(vcm->drdynvc_channel, (PCHAR)data, length, &written) &&
++	       written == length;
++}
++
+ static BOOL WTSProcessChannelData(rdpPeerChannel* channel, UINT16 channelId, const BYTE* data,
+                                   size_t s, UINT32 flags, size_t t)
+ {
+@@ -746,6 +827,101 @@ void WTSVirtualChannelManagerSetDVCCreationCallback(HANDLE hServer,
+ 	vcm->dvc_creation_status_userdata = userdata;
+ }
+ 
++void WTSVirtualChannelManagerSetDVCTunnelCallback(HANDLE hServer, psDVCTunnelSendCallback cb,
++                                                  void* userdata)
++{
++	WTSVirtualChannelManager* vcm = hServer;
++	WINPR_ASSERT(vcm);
++	vcm->dvc_tunnel_send = cb;
++	vcm->dvc_tunnel_send_userdata = userdata;
++}
++
++BOOL WTSVirtualChannelManagerStartSoftSync(HANDLE hServer, UINT32 tunnelType,
++                                           const UINT32* channelIds, size_t channelCount)
++{
++	WTSVirtualChannelManager* vcm = hServer;
++	if (!vcm || !channelIds || channelCount == 0 || channelCount > UINT16_MAX ||
++	    !vcm->drdynvc_channel || vcm->drdynvc_state != DRDYNVC_STATE_READY ||
++	    !vcm->dvc_tunnel_send || vcm->dvc_soft_sync_pending)
++		return FALSE;
++
++	const size_t listSize = 6u + (channelCount * 4u);
++	const size_t pduSize = 10u + listSize;
++	if (pduSize > UINT32_MAX)
++		return FALSE;
++
++	/* Validate the complete selection before mutating the current routing state. */
++	for (size_t index = 0; index < channelCount; index++)
++	{
++		rdpPeerChannel* dvc = wts_get_dvc_channel_by_id(vcm, channelIds[index]);
++		if (!dvc || dvc->dvc_open_state != DVC_OPEN_STATE_SUCCEEDED)
++			return FALSE;
++	}
++
++	wStream* s = Stream_New(nullptr, pduSize);
++	if (!s)
++		return FALSE;
++
++	wts_clear_dvc_udp_state(vcm);
++	for (size_t index = 0; index < channelCount; index++)
++	{
++		rdpPeerChannel* dvc = wts_get_dvc_channel_by_id(vcm, channelIds[index]);
++		WINPR_ASSERT(dvc);
++		dvc->dvc_udp_selected = TRUE;
++	}
++	Stream_Write_UINT8(s, (SOFT_SYNC_REQUEST_PDU << 4));
++	Stream_Write_UINT8(s, 0); /* Pad */
++	Stream_Write_UINT32(s, WINPR_ASSERTING_INT_CAST(UINT32, 8u + listSize));
++	Stream_Write_UINT16(s, SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT);
++	Stream_Write_UINT16(s, 1); /* NumberOfTunnels */
++	Stream_Write_UINT32(s, tunnelType);
++	Stream_Write_UINT16(s, WINPR_ASSERTING_INT_CAST(UINT16, channelCount));
++	for (size_t index = 0; index < channelCount; index++)
++		Stream_Write_UINT32(s, channelIds[index]);
++
++	const UINT32 pduLength = WINPR_ASSERTING_INT_CAST(UINT32, Stream_GetPosition(s));
++	ULONG written = 0;
++	const BOOL rc = WTSVirtualChannelWrite(vcm->drdynvc_channel,
++	                                       Stream_BufferAs(s, char),
++	                                       pduLength,
++	                                       &written);
++	Stream_Free(s, TRUE);
++	if (!rc || written != pduLength)
++	{
++		wts_clear_dvc_udp_state(vcm);
++		return FALSE;
++	}
++
++	vcm->dvc_soft_sync_tunnel_type = tunnelType;
++	vcm->dvc_soft_sync_pending = TRUE;
++	vcm->dvc_soft_sync_active = FALSE;
++	return TRUE;
++}
++
++BOOL WTSVirtualChannelManagerReceiveDVCTunnelData(HANDLE hServer, const BYTE* data,
++                                                  UINT32 length)
++{
++	WTSVirtualChannelManager* vcm = hServer;
++	if (!vcm || !data || length == 0 || !vcm->drdynvc_channel ||
++	    vcm->drdynvc_state != DRDYNVC_STATE_READY || !vcm->dvc_soft_sync_active)
++		return FALSE;
++
++	rdpPeerChannel* channel = vcm->drdynvc_channel;
++	Stream_ResetPosition(channel->receiveData);
++	if (!Stream_EnsureRemainingCapacity(channel->receiveData, length))
++		return FALSE;
++	Stream_Write(channel->receiveData, data, length);
++	const BOOL rc = wts_read_drdynvc_pdu(channel);
++	Stream_ResetPosition(channel->receiveData);
++	return rc;
++}
++
++BOOL WTSVirtualChannelManagerIsSoftSyncActive(HANDLE hServer)
++{
++	const WTSVirtualChannelManager* vcm = hServer;
++	return vcm && vcm->dvc_soft_sync_active;
++}
++
+ UINT16 WTSChannelGetId(freerdp_peer* client, const char* channel_name)
+ {
+ 	rdpMcsChannel* channel = nullptr;
+@@ -1615,7 +1791,6 @@ BOOL WINAPI FreeRDP_WTSVirtualChannelClose(HANDLE hChannelHandle)
+ 		{
+ 			if (channel->dvc_open_state == DVC_OPEN_STATE_SUCCEEDED)
+ 			{
+-				ULONG written = 0;
+ 				s = Stream_New(nullptr, 8);
+ 
+ 				if (!s)
+@@ -1629,8 +1804,8 @@ BOOL WINAPI FreeRDP_WTSVirtualChannelClose(HANDLE hChannelHandle)
+ 
+ 					const size_t pos = Stream_GetPosition(s);
+ 					WINPR_ASSERT(pos <= UINT32_MAX);
+-					ret = WTSVirtualChannelWrite(vcm->drdynvc_channel, Stream_BufferAs(s, char),
+-					                             (UINT32)pos, &written);
++					ret = wts_send_drdynvc_pdu(channel, Stream_ConstBuffer(s),
++					                            (UINT32)pos);
+ 					Stream_Free(s, TRUE);
+ 				}
+ 			}
+@@ -1763,14 +1938,23 @@ BOOL WINAPI FreeRDP_WTSVirtualChannelWrite(HANDLE hChannelHandle, PCHAR Buffer,
+ 
+ 			Stream_Write(s, Buffer, written);
+ 			const size_t length = Stream_GetPosition(s);
+-			Stream_Free(s, FALSE);
+ 			if (length > UINT32_MAX)
++			{
++				Stream_Free(s, TRUE);
++				s = nullptr;
+ 				goto fail;
++			}
+ 			Length -= written;
+ 			Buffer += written;
+ 			totalWritten += written;
+-			if (!wts_queue_send_item(channel->vcm->drdynvc_channel, buffer, (UINT32)length))
++			if (!wts_send_drdynvc_pdu(channel, Stream_ConstBuffer(s), (UINT32)length))
++			{
++				Stream_Free(s, TRUE);
++				s = nullptr;
+ 				goto fail;
++			}
++			Stream_Free(s, TRUE);
++			s = nullptr;
+ 		}
+ 	}
+ 
+@@ -1779,6 +1963,7 @@ BOOL WINAPI FreeRDP_WTSVirtualChannelWrite(HANDLE hChannelHandle, PCHAR Buffer,
+ 
+ 	ret = TRUE;
+ fail:
++	Stream_Free(s, TRUE);
+ 	LeaveCriticalSection(&channel->writeLock);
+ 	return ret;
+ }
+diff --git a/include/freerdp/codec/progressive.h b/include/freerdp/codec/progressive.h
+--- a/include/freerdp/codec/progressive.h
++++ b/include/freerdp/codec/progressive.h
+@@ -65,6 +65,16 @@ extern "C"
+ 	WINPR_ATTR_NODISCARD
+ 	FREERDP_API BOOL progressive_context_reset(PROGRESSIVE_CONTEXT* WINPR_RESTRICT progressive);
+ 
++	/** Override the RemoteFX quantization tables used by the Progressive
++	 * encoder. Values use the protocol range 6..15 in LL3..HH1 order. Pass one
++	 * table (10 values) for a shared Y/Cb/Cr table, or three consecutive tables
++	 * (30 values) for independent Y, Cb, and Cr quantization. This is a private
++	 * server extension used for motion-adaptive TCP quality. */
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL progressive_context_set_quantization(
++	    PROGRESSIVE_CONTEXT* WINPR_RESTRICT progressive,
++	    const UINT32* WINPR_RESTRICT values, size_t count);
++
+ 	FREERDP_API void progressive_context_free(PROGRESSIVE_CONTEXT* progressive);
+ 
+ 	WINPR_ATTR_MALLOC(progressive_context_free, 1)
+diff --git a/libfreerdp/codec/progressive.c b/libfreerdp/codec/progressive.c
+--- a/libfreerdp/codec/progressive.c
++++ b/libfreerdp/codec/progressive.c
+@@ -2629,6 +2629,35 @@ BOOL progressive_context_reset(PROGRESSIVE_CONTEXT* WINPR_RESTRICT progressive)
+ 	return (progressive != nullptr);
+ }
+ 
++BOOL progressive_context_set_quantization(PROGRESSIVE_CONTEXT* WINPR_RESTRICT progressive,
++                                           const UINT32* WINPR_RESTRICT values,
++                                           size_t count)
++{
++	if (!progressive || !progressive->Compressor || !progressive->rfx_context || !values ||
++	    ((count != NR_QUANT_VALUES) && (count != (3u * NR_QUANT_VALUES))))
++		return FALSE;
++
++	for (size_t index = 0; index < count; index++)
++	{
++		if (values[index] < 6u || values[index] > 15u)
++			return FALSE;
++	}
++
++	UINT32* quants = (UINT32*)winpr_aligned_malloc(count * sizeof(UINT32), 32);
++	if (!quants)
++		return FALSE;
++	CopyMemory(quants, values, count * sizeof(UINT32));
++
++	RFX_CONTEXT* rfx = progressive->rfx_context;
++	winpr_aligned_free(rfx->quants);
++	rfx->quants = quants;
++	rfx->numQuant = (BYTE)(count / NR_QUANT_VALUES);
++	rfx->quantIdxY = 0;
++	rfx->quantIdxCb = (rfx->numQuant == 3u) ? 1u : 0u;
++	rfx->quantIdxCr = (rfx->numQuant == 3u) ? 2u : 0u;
++	return TRUE;
++}
++
+ PROGRESSIVE_CONTEXT* progressive_context_new(BOOL Compressor)
+ {
+ 	return progressive_context_new_ex(Compressor, 0);

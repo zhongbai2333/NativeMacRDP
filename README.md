@@ -1,239 +1,179 @@
-# macos-rdp-server
+# NativeMacRDP
 
-A lightweight RDP server daemon for macOS Tahoe and later. Connect to your Mac from any standard RDP client — Windows Remote Desktop, FreeRDP, Remmina — with the same smoothness you'd expect from a Windows environment.
+[![CI](https://github.com/zhongbai2333/NativeMacRDP/actions/workflows/ci.yml/badge.svg)](https://github.com/zhongbai2333/NativeMacRDP/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Features
+NativeMacRDP is an experimental native RDP server for macOS. It exposes the
+logged-in Mac desktop directly to standard RDP clients without passing through
+a VNC server. The most-tested client is Microsoft Windows App on iPad.
 
-- **H.264 hardware encoding** via VideoToolbox — low latency, low CPU
-- **CGVirtualDisplay** — creates a dedicated virtual display for each session; your physical screen is undisturbed
-- **Full keyboard & mouse injection** via CGEventPost with a complete RDP scan-code table
-- **Bidirectional clipboard** — text and images sync between client and host
-- **System audio redirection** — hear your Mac's audio through the RDP client
-- **Structured logging** — four levels (ERROR / INFO / VERBOSE / DEBUG), set via flag or env var
-- **DriverKit HID extension** *(optional, requires Apple Developer account)* — injects input at the HID stack level, works at the login window and in secure input fields
-- **launchd integration** — auto-starts at boot, restarts on crash
-- **TLS encryption** — self-signed certificate generated on install; clients trust on first connect
+The supported profile uses RDPGFX Progressive over TCP, ScreenCaptureKit for
+capture, CGEvent for input, and a BetterDisplay virtual screen sized to the RDP
+client. H.264/AVC and reliable UDP code are retained for research, but neither
+is part of the default deployment.
+
+> [!WARNING]
+> NativeMacRDP is pre-release software. It uses some undocumented macOS APIs,
+> has not received an independent security audit, and currently runs with NLA
+> disabled. Keep the listener on loopback or a trusted LAN and use a VPN or an
+> authenticated tunnel for remote access. Do not expose it directly to the
+> public Internet.
+
+## Highlights
+
+- Native RDP/TLS server built on a pinned FreeRDP 3.30.0 source release
+- RDPGFX Progressive transport with dirty-region coalescing and frame shedding
+- ACK/QoE-driven TCP pacing and motion-aware quality reduction
+- BetterDisplay virtual-screen lifecycle and MS-RDPEDISP dynamic resizing
+- Unicode keyboard, pointer, high-resolution wheel, text/PNG clipboard, and
+  bounded regular-file clipboard implementations
+- Short reconnect grace, standard auto-reconnect cookies, client liveness
+  detection, and in-place RDPGFX surface recovery
+- Optional system audio, microphone, drive redirection, AVC, and reliable UDP
+  paths, all disabled in the stable installer unless explicitly enabled
+
+The detailed implementation and trust boundaries are documented in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The live feature matrix is in
+[`docs/TESTING.md`](docs/TESTING.md).
 
 ## Requirements
 
-- macOS 14 Sonoma or later
-- Homebrew (only needed when building from source; pre-built binaries have no runtime dependencies)
-- Xcode Command Line Tools (source builds only)
+- macOS 14 or newer; currently tested on macOS 26 and Apple silicon
+- Xcode Command Line Tools
+- [Homebrew](https://brew.sh/)
+- [BetterDisplay](https://github.com/waydabber/BetterDisplay) for the tested
+  virtual-display path
+- A logged-in Aqua session; ScreenCaptureKit and BetterDisplay cannot provide
+  this desktop from a system LaunchDaemon
 
-## One-line install
-
-> [!IMPORTANT]
-> **Screen capture requires the daemon to run in your GUI (Aqua) login session.** The
-> system LaunchDaemon installed by the commands in this section has no WindowServer
-> connection and will render a **black screen**. For a working, durable setup — one that
-> also keeps the Screen Recording / Accessibility permission valid across updates — use
-> the per-user installer instead, after obtaining the binary:
->
-> ```bash
-> scripts/install-user.sh /usr/local/sbin/macos-rdp-daemon   # or any path to the binary
-> ```
->
-> It runs the daemon as a per-user LaunchAgent (Aqua session → WindowServer → capture
-> works) and signs it with a stable self-signed certificate, so macOS pins the permission
-> grant to the signature rather than the cdhash that changes on every rebuild. No sudo.
+Install the build dependencies:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/remote-install.sh | sudo bash
+brew install cmake pkg-config openssl@3 ffmpeg uriparser jansson
 ```
 
-Downloads the latest pre-built **universal binary** (a single file that runs natively on both Intel and Apple Silicon) from GitHub Releases. No Homebrew, no compilation, no runtime dependencies — the binary links only against macOS system frameworks.
-
-The script will:
-1. Download the universal binary to `/usr/local/sbin/macos-rdp-daemon`
-2. Generate a self-signed TLS certificate at `/etc/macos-rdp/`
-3. Install and load the launchd service on port 3389
-4. Print your IP address and the two Privacy permission steps required
-
-Or download the binary directly:
-```bash
-sudo curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/latest/download/macos-rdp-daemon \
-  -o /usr/local/sbin/macos-rdp-daemon && sudo chmod +x /usr/local/sbin/macos-rdp-daemon
-```
-
-Verify the download against the published checksum:
-```bash
-curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/latest/download/SHA256SUMS | shasum -c
-```
-
-After installation, open any RDP client and connect to your Mac's IP address.
-
-> **Reproducible builds.** Release binaries are built entirely from source-pinned forks
-> (FreeRDP and OpenSSL), statically linked, in a single CI pass. Nothing is pulled from a
-> package manager at build or run time. See [`.github/workflows/release.yml`](.github/workflows/release.yml).
-
-## Manual install
+## Build and test
 
 ```bash
-# 1. Install dependencies
-brew install freerdp cmake openssl
-
-# 2. Clone
-git clone https://github.com/grioghar/macos-rdp-server.git
-cd macos-rdp-server
-
-# 3. Build & install
-sudo bash scripts/install.sh
+./scripts/build.sh
 ```
 
-## Connect
+The script downloads the pinned FreeRDP archive, verifies its SHA-256, applies
+the patches in [`patches`](patches), builds FreeRDP and NativeMacRDP, and runs
+the protocol tests. Generated files stay under the ignored `work/` directory.
+The daemon is written to:
 
-| Client | Steps |
-|---|---|
-| Windows Remote Desktop | Start → `mstsc` → enter your Mac's IP |
-| macOS Remote Desktop | App Store → Microsoft Remote Desktop → Add PC |
-| FreeRDP (CLI) | `xfreerdp /v:your-mac-ip /u:$(whoami) /cert:ignore` |
-| Remmina | New connection → protocol RDP → enter IP |
+```text
+work/build-patched/daemon-build/macos-rdp-daemon
+```
 
-On first connect your client will show a certificate trust prompt — accept it. Subsequent connections skip this.
+## Install for one macOS user
 
-## Privacy permissions
-
-macOS gates the daemon's capabilities behind Privacy & Security:
-
-| Permission | Required for |
-|---|---|
-| Screen Recording | `CGDisplayStream` frame capture |
-| Accessibility | `CGEventPost` keyboard & mouse injection |
-| Microphone | CoreAudio system audio tap |
-
-The installer opens the relevant panes automatically. To (re)run the helper:
+The default installation listens only on loopback:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/grant-permissions.sh | sudo bash
+./scripts/install-user.sh \
+  work/build-patched/daemon-build/macos-rdp-daemon
 ```
 
-What it does:
-- **SIP enabled** (default): opens the **Screen Recording** and **Accessibility** panes. Click **+ → Cmd-Shift-G → `/usr/local/sbin`**, select `macos-rdp-daemon`, and toggle it on. (Once an RDP client has connected once, the binary registers itself in these lists, so you can just flip the switch.)
-- **SIP disabled**: grants both permissions directly by writing the system TCC database, then restarts the daemon — no clicking.
-
-> macOS does not allow any tool to grant Screen Recording / Accessibility programmatically while SIP is on — that restriction is the whole point of TCC. The helper makes the manual step as close to one click as the OS permits. Fully unattended granting requires [disabling SIP](docs/no-signing.md).
-
-After enabling both, restart the service:
-```bash
-sudo launchctl kickstart -k system/com.macosrdp.daemon
-```
-
-## Configuration
-
-### Port
-
-Edit `/Library/LaunchDaemons/com.macosrdp.daemon.plist`:
+For a trusted LAN, opt in to a non-loopback listener:
 
 ```bash
-sudo launchctl unload /Library/LaunchDaemons/com.macosrdp.daemon.plist
-# set --port <n> in ProgramArguments
-sudo launchctl load -w /Library/LaunchDaemons/com.macosrdp.daemon.plist
+RDP_BIND_ADDRESS=0.0.0.0 RDP_PORT=3389 \
+  ./scripts/install-user.sh \
+  work/build-patched/daemon-build/macos-rdp-daemon
 ```
 
-| Flag | Default | Description |
-|---|---|---|
-| `--port` | `3389` | TCP port to listen on |
-| `--log-level` | `info` | Log verbosity (see below) |
+The installer creates a per-user LaunchAgent, generates a local RDP TLS
+certificate, installs the BetterDisplay lifecycle helper, and signs the daemon
+with a stable identity. It does not require `sudo`.
 
-## Logging
+On first use, approve the installed `NativeMacRDP` executable in:
 
-The daemon uses a four-level structured logger. Each log line includes a timestamp, level tag, and subsystem component:
+- System Settings → Privacy & Security → Screen & System Audio Recording
+- System Settings → Privacy & Security → Accessibility
 
-```
-[14:23:01.042] [INFO ] [server] listening for RDP connections on port 3389
-[14:23:04.187] [INFO ] [main  ] client connected from ::ffff:192.168.1.5
-[14:23:04.201] [INFO ] [peer  ] peer activated: 1920x1080 @32bpp
-[14:23:04.203] [INFO ] [session] setting up display 1920x1080 for ::ffff:192.168.1.5
-[14:23:04.251] [INFO ] [display] virtual display created: displayID=3 1920x1080
-[14:23:04.260] [INFO ] [encoder] H.264 encoder ready: 1920x1080 @ 8000 kbps
-[14:23:04.261] [INFO ] [capture] capture started on displayID=3
-[14:23:04.265] [INFO ] [audio  ] audio capture started on device 48
-[14:23:04.266] [INFO ] [session] session active for ::ffff:192.168.1.5
-```
+Restart the service after granting access. Reusing the same signing identity is
+important because changing the executable identity can make macOS request the
+permissions again.
 
-### Log levels
+With FileVault enabled, user LaunchAgents cannot start after a cold boot until
+someone unlocks the Mac. This is a macOS platform boundary, not an RDP setting.
 
-| Level | What it logs | Use when |
-|---|---|---|
-| `error` | Hard failures that stop a session or the daemon | Production; quiet machines |
-| `info` | Connection lifecycle — connect, activate, disconnect | Default |
-| `verbose` | Subsystem events — channel opens, display creation, encoder start, audio start | Diagnosing connection or feature issues |
-| `debug` | Per-frame and per-event detail — every keypress, every encoded frame size, every dirty rect | Deep protocol troubleshooting |
+## Remote access
 
-> **Warning:** `debug` logs every captured frame and input event. At 60fps this is ~3,600 lines/minute. Use it for short captures only.
+Secret-free FRP examples are provided in [`deploy/tunnel`](deploy/tunnel). The
+supported tunnel profile forwards TCP only. Keep tokens, TLS private keys, real
+server addresses, and machine-specific paths outside this repository.
 
-### Setting the log level
+For LAN clients, prefer the Mac's `<LocalHostName>.local` Bonjour name or a DHCP
+reservation instead of assuming that its numeric address will not change.
 
-**CLI flag** (one-off / manual runs):
-```bash
-sudo macos-rdp-daemon --log-level verbose
-sudo macos-rdp-daemon --log-level debug
-```
+## Default runtime profile
 
-**Environment variable** (persists across restarts):
-```bash
-# Live, without editing the plist:
-sudo launchctl setenv RDP_LOG_LEVEL verbose
-sudo launchctl kickstart -k system/com.macosrdp.daemon
+| Setting | Default | Purpose |
+|---|---:|---|
+| `RDP_NETWORK_AUTO_DETECT` | `1` | Seed pacing from measured bandwidth and RTT |
+| `RDP_PROGRESSIVE_MBIT` | `60` in installer | Progressive transport ceiling |
+| `RDP_PROGRESSIVE_MIN_MBIT` | `2` | Minimum automatic low-bandwidth target |
+| `RDP_RECONNECT_GRACE_SECONDS` | `30` in installer | Retain the desktop briefly after link loss |
+| `RDP_CLIENT_LIVENESS_TIMEOUT_SECONDS` | `20` | Close a half-open client transport |
+| `RDP_CURSOR_SHAPES` | `1` in installer | Send sanitized native cursor shapes |
+| `RDP_CURSOR_POSITION_ECHO` | `buttons` | Echo click positions without WAN motion lag |
+| `RDP_UNICODE_INPUT` | `1` | Accept RDP Unicode input events |
+| `RDP_SCROLL_PIXEL_SCALE` | `1.0` | Scale high-resolution wheel input |
+| `RDP_AUDIO_OUTPUT` | `0` | Opt in to Mac system-audio redirection |
+| `RDP_AUDIO_INPUT` | `0` | Opt in to microphone redirection |
+| `RDP_RDPDR_ENABLED` | `0` | Opt in to drive redirection |
+| `RDP_UDP_ENABLED` | `0` | Opt in to the experimental reliable-UDP path |
+| `RDP_UPDATE_ENABLED` | `0` | No unattended binary replacement |
 
-# Or set it permanently in the launchd plist:
-# /Library/LaunchDaemons/com.macosrdp.daemon.plist
-# → EnvironmentVariables → RDP_LOG_LEVEL
-```
+See [`docs/TESTING.md`](docs/TESTING.md) for the complete environment-variable
+reference and for the distinction between implemented, live-tested, and
+untested behavior.
 
-### Reading logs
+## Service management
 
 ```bash
-# Follow the daemon log file directly:
-tail -f /var/log/macos-rdp-daemon.error.log
+# Inspect the user service
+launchctl print "gui/$(id -u)/com.nativemacrdp.agent"
 
-# Filter by level:
-tail -f /var/log/macos-rdp-daemon.error.log | grep '\[ERROR\]'
+# Restart it
+launchctl kickstart -k "gui/$(id -u)/com.nativemacrdp.agent"
 
-# Via macOS unified logging (also shows os_log entries):
-log stream --predicate 'process == "macos-rdp-daemon"' --level debug
-
-# Historical logs in Console.app:
-# Filter by process name "macos-rdp-daemon"
+# Follow errors
+tail -f "$HOME/Library/Logs/native-mac-rdp.error.log"
 ```
 
-## Uninstall
+## Known limitations
 
-```bash
-sudo bash scripts/uninstall.sh
-```
+- The tested Windows App path is TCP Progressive, not H.264/AVC or UDP.
+- BetterDisplay is an external dependency and its command-line interface may
+  change between releases.
+- The fallback virtual-display and cursor paths use undocumented macOS APIs and
+  can change without notice in a macOS update.
+- Secure login-window input is not supported. The server controls an already
+  logged-in Aqua session.
+- iPadOS and Windows App can reserve some Command-key shortcuts before the
+  remote Mac receives them.
+- Only one active retained desktop/session is supported.
+- Intel Macs, independent multi-monitor displays, long soak tests, image
+  clipboard interoperability, folder clipboard copy, and drive mounting need
+  more validation or implementation.
 
-## Architecture
+## Contributing and security
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                  macos-rdp-daemon (root)                 │
-│                                                          │
-│  TCP :3389 ──► RDPServer ──► RDPSession (per client)    │
-│                                   │                      │
-│              ┌────────────────────┼──────────────────┐   │
-│              │                   │                   │   │
-│         RDPPeer              VirtualDisplay    AudioCapture
-│      (libfreerdp 3)        (CGVirtualDisplay) (CoreAudio HAL)
-│              │                   │                   │   │
-│         GFX Pipeline       ScreenCapture       AudioRedirect
-│       (H.264 AVC420)     (CGDisplayStream)     (RDPSND ch.)
-│              │                   │                        │
-│         InputInjector       FrameEncoder                  │
-│        (CGEventPost)      (VideoToolbox)                  │
-│              │                                            │
-│         ClipboardSync      RDPLog                         │
-│        (NSPasteboard)   (ERROR/INFO/VERBOSE/DEBUG)        │
-└─────────────────────────────────────────────────────────┘
+Contributions are welcome; start with [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Please report vulnerabilities privately as described in
+[`SECURITY.md`](SECURITY.md), not in a public issue.
 
-Optional DriverKit HID extension (requires Apple Developer account):
-injects keyboard/mouse at the HID level — works at login window
-```
+## Origin and license
 
-## Without an Apple Developer account
+NativeMacRDP is derived from
+[`grioghar/macos-rdp-server`](https://github.com/grioghar/macos-rdp-server),
+whose original Git history and copyright notice are retained. NativeMacRDP is
+available under the same permissive [MIT License](LICENSE).
 
-The daemon runs fully without code signing. You only need a Developer account for the optional DriverKit HID extension. See [Running without signing](docs/no-signing.md).
-
-## License
-
-MIT
+The build also links FreeRDP under Apache-2.0. See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for dependency and
+redistribution details.

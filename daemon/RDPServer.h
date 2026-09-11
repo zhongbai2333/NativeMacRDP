@@ -14,15 +14,16 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, weak, nullable) id<RDPServerDelegate> delegate;
 @property (nonatomic, readonly) uint16_t port;
+@property (nonatomic, readonly, copy) NSString *bindAddress;
 @property (nonatomic, readonly) BOOL isRunning;
 
-- (instancetype)initWithPort:(uint16_t)port;
+- (instancetype)initWithPort:(uint16_t)port bindAddress:(NSString *)bindAddress;
 - (BOOL)startWithError:(NSError **)error;
 - (void)stop;
 
 /* YES if a client session is currently active (authenticated + owns the
  * display). Used by the auto-updater to defer a swap/restart while a user is
- * connected. Class-level so AutoUpdate need not hold an RDPServer reference;
+ * connected. Class-level so management code need not hold an RDPServer reference;
  * backed by the single live server instance's active-session registry. */
 + (BOOL)hasActiveSession;
 

@@ -1,8 +1,24 @@
+# Build and test output
 build/
+work/
+DerivedData/
+*.xcodeproj/
+xcuserdata/
+compile_commands.json
 *.o
 *.a
 *.dylib
+
+# Local runtime state and credentials
+.env
+*.log
+*.key
+*.crt
+*.pem
+*.p12
+*.keychain-db
+frp/
+
+# macOS/editor metadata
 .DS_Store
-*.xcodeproj/
-xcuserdata/
-DerivedData/
+.claude/scheduled_tasks.lock

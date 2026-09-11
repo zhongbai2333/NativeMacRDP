@@ -1,154 +1,224 @@
-#!/bin/bash
-# install-user.sh — durable, sudo-free install of macos-rdp-daemon as a per-user
-# LaunchAgent in the Aqua (GUI) session.
-#
-# Why this exists instead of install.sh's LaunchDaemon:
-#   * Screen capture requires the daemon to run inside the user's GUI (Aqua) session
-#     so it has a WindowServer connection. A system LaunchDaemon does NOT, which is why
-#     the daemon rendered a black screen under the old install.
-#   * macOS TCC pins the Screen-Recording / Accessibility grant to the binary's code
-#     signature. An ad-hoc / linker signature gets a new cdhash on every rebuild, so the
-#     grant breaks each time you update. This script signs the binary with a STABLE
-#     self-signed certificate, so TCC pins to the (identifier + cert) requirement and the
-#     grant SURVIVES rebuilds. Re-running this script to deploy a new build keeps the grant.
-#   * Everything lives under $HOME, so no sudo is ever required.
-#
-# Usage:
-#   scripts/install-user.sh [path-to-macos-rdp-daemon]
-#     If no path is given, falls back to ./build/macos-rdp-daemon.
-#
-# NOTE: This codifies the exact sequence validated manually over SSH. Verify end-to-end
-# on a real Mac after any change.
+#!/bin/zsh
+
+# Install NativeMacRDP as a per-user LaunchAgent in the Aqua session. This is
+# intentionally sudo-free: ScreenCaptureKit and CGEvent permissions belong to
+# the logged-in user session, not a system LaunchDaemon.
 
 set -euo pipefail
 
-if [[ $EUID -eq 0 ]]; then
-    echo "Run as your normal user, NOT root — this installs a per-user LaunchAgent." >&2
+if (( EUID == 0 )); then
+    /bin/echo "Run as the normal desktop user, not root." >&2
     exit 1
 fi
 
-PORT="${RDP_PORT:-3389}"
-ROOT="$HOME/.macos-rdp"
-BIN_DIR="$ROOT/bin"
-SIGN_DIR="$ROOT/signing"
-BIN="$BIN_DIR/macos-rdp-daemon"
-PLIST="$HOME/Library/LaunchAgents/com.macosrdp.agent.plist"
-LABEL="com.macosrdp.agent"
-GUI="gui/$(id -u)"
-KC="$SIGN_DIR/macos-rdp.keychain-db"
-KCPASS="macosrdp"
-P12PASS="temp12"
-CN="macos-rdp-signing"
+repo_root="${0:A:h:h}"
+port="${RDP_PORT:-3389}"
+bind_address="${RDP_BIND_ADDRESS:-127.0.0.1}"
+audio_output="${RDP_AUDIO_OUTPUT:-0}"
+audio_local="${RDP_AUDIO_LOCAL:-1}"
+audio_latency="${RDP_AUDIO_LATENCY_MS:-100}"
+udp_enabled="${RDP_UDP_ENABLED:-0}"
+install_root="${NATIVE_MAC_RDP_ROOT:-$HOME/Library/Application Support/NativeMacRDP}"
+bin_dir="$install_root/bin"
+binary="$bin_dir/NativeMacRDP"
+display_helper="$bin_dir/betterdisplay-session.sh"
+agent="$HOME/Library/LaunchAgents/com.nativemacrdp.agent.plist"
+label="com.nativemacrdp.agent"
+gui="gui/$(/usr/bin/id -u)"
+log_dir="$HOME/Library/Logs"
+source_binary="${1:-$repo_root/work/build-patched/daemon-build/macos-rdp-daemon}"
+betterdisplay="${RDP_BETTERDISPLAY_BIN:-/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay}"
 
-# 1. Locate the binary to install ------------------------------------------------------
-SRC="${1:-}"
-if [[ -z "$SRC" ]]; then
-    if [[ -x "./build/macos-rdp-daemon" ]]; then
-        SRC="./build/macos-rdp-daemon"
-    else
-        echo "No binary given and ./build/macos-rdp-daemon not found." >&2
-        echo "Build first, or: scripts/install-user.sh /path/to/macos-rdp-daemon" >&2
-        exit 1
+if [[ "$port" != <-> ]] || (( port < 1 || port > 65535 )); then
+    /bin/echo "Invalid RDP_PORT: $port" >&2
+    exit 64
+fi
+if ! /bin/echo "$bind_address" | /usr/bin/grep -Eq '^[0-9A-Fa-f:.]+$'; then
+    /bin/echo "RDP_BIND_ADDRESS must be a literal IPv4 or IPv6 address" >&2
+    exit 64
+fi
+for setting in audio_output audio_local udp_enabled; do
+    value="${(P)setting}"
+    if [[ "$value" != "0" && "$value" != "1" ]]; then
+        /bin/echo "${setting:u} must be 0 or 1" >&2
+        exit 64
     fi
+done
+if [[ "$audio_latency" != <-> ]] ||
+        (( audio_latency < 40 || audio_latency > 250 )); then
+    /bin/echo "RDP_AUDIO_LATENCY_MS must be between 40 and 250" >&2
+    exit 64
 fi
-[[ -f "$SRC" ]] || { echo "Binary not found: $SRC" >&2; exit 1; }
+[[ -x "$source_binary" ]] || {
+    /bin/echo "Missing executable: $source_binary" >&2
+    /bin/echo "Run ./scripts/build.sh first, or pass the binary path." >&2
+    exit 1
+}
+[[ -x "$betterdisplay" ]] || {
+    /bin/echo "BetterDisplay is required for the verified virtual-display profile." >&2
+    /bin/echo "Expected executable: $betterdisplay" >&2
+    exit 1
+}
 
-mkdir -p "$BIN_DIR" "$SIGN_DIR" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+/bin/mkdir -p "$bin_dir" "$install_root/signing" \
+    "$HOME/Library/LaunchAgents" "$log_dir"
 
-# 2. Stable self-signed code-signing cert (created once, reused on every rebuild) -------
-if [[ ! -f "$SIGN_DIR/cert.pem" ]]; then
-    echo "==> Generating stable self-signed code-signing certificate..."
-    cat > "$SIGN_DIR/openssl.cnf" <<'CNF'
-[req]
-distinguished_name = dn
-x509_extensions    = v3
-prompt             = no
-[dn]
-CN = macos-rdp-signing
-[v3]
-basicConstraints   = critical,CA:false
-keyUsage           = critical,digitalSignature
-extendedKeyUsage   = critical,codeSigning
-CNF
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-        -keyout "$SIGN_DIR/key.pem" -out "$SIGN_DIR/cert.pem" \
-        -config "$SIGN_DIR/openssl.cnf"
-    openssl pkcs12 -export -name "$CN" \
-        -inkey "$SIGN_DIR/key.pem" -in "$SIGN_DIR/cert.pem" \
-        -out "$SIGN_DIR/cert.p12" -passout "pass:$P12PASS"
-fi
-
-# 3. Keychain holding the signing identity (idempotent, unlocked, no auto-lock) ---------
-security delete-keychain "$KC" 2>/dev/null || true
-security create-keychain -p "$KCPASS" "$KC"
-security set-keychain-settings "$KC"
-security unlock-keychain -p "$KCPASS" "$KC"
-security list-keychains -d user -s "$KC" "$HOME/Library/Keychains/login.keychain-db"
-security import "$SIGN_DIR/cert.p12" -k "$KC" -P "$P12PASS" -T /usr/bin/codesign -A
-security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPASS" "$KC" >/dev/null 2>&1 || true
-
-HASH="$(security find-certificate -c "$CN" -Z "$KC" | awk '/SHA-1/{print $3; exit}')"
-[[ -n "$HASH" ]] || { echo "Could not determine signing cert hash" >&2; exit 1; }
-
-# 4. Install + sign the binary (stable DR -> TCC grant survives rebuilds) ---------------
-echo "==> Installing and signing binary..."
-cp "$SRC" "$BIN"
-chmod 755 "$BIN"
-# The cert is untrusted for Gatekeeper, but TCC matches the Designated Requirement (not
-# Gatekeeper trust) and launchd runs it regardless, so this is all we need.
-codesign --keychain "$KC" -s "$HASH" --identifier macos-rdp-daemon --force "$BIN"
-codesign -d -r- "$BIN" 2>&1 | grep -i "designated" || true
-
-# 5. RDP TLS certificate (self-signed) into the user cert dir ---------------------------
-if [[ ! -f "$ROOT/server.crt" || ! -f "$ROOT/server.key" ]]; then
-    echo "==> Generating RDP TLS certificate..."
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-        -keyout "$ROOT/server.key" -out "$ROOT/server.crt" \
-        -subj "/CN=$(hostname)"
-    chmod 600 "$ROOT/server.key"
+# Ask an existing instance to leave through the normal RDP disconnect path,
+# then wait briefly before replacing the executable.
+old_pid="$(/bin/launchctl print "$gui/$label" 2>/dev/null |
+    /usr/bin/awk '/^[[:space:]]*pid = / { print $3; exit }')"
+/bin/launchctl bootout "$gui/$label" 2>/dev/null || true
+if [[ -n "$old_pid" ]]; then
+    for _attempt in {1..50}; do
+        /bin/kill -0 "$old_pid" 2>/dev/null || break
+        /bin/sleep 0.1
+    done
 fi
 
-# 6. Per-user LaunchAgent (Aqua session => WindowServer => capture works) ---------------
-echo "==> Writing LaunchAgent..."
-cat > "$PLIST" <<PL
+/usr/bin/install -m 0755 "$source_binary" "$binary"
+/usr/bin/install -m 0755 "$repo_root/scripts/betterdisplay-session.sh" \
+    "$display_helper"
+
+# Prefer a caller-selected or existing Apple Development identity. If neither
+# exists, create one stable local identity and reuse it across upgrades so TCC
+# permissions stay associated with the same designated requirement.
+sign_identity="${RDP_SIGN_IDENTITY:-$(
+    /usr/bin/security find-identity -v -p codesigning 2>/dev/null |
+        /usr/bin/awk -F'"' '/Apple Development:/ { print $2; exit }'
+)}"
+
+if [[ -n "$sign_identity" ]]; then
+    /usr/bin/codesign --force --sign "$sign_identity" --timestamp=none \
+        --identifier com.nativemacrdp.daemon "$binary"
+else
+    openssl_bin="${commands[openssl]:-}"
+    [[ -n "$openssl_bin" ]] || {
+        /bin/echo "openssl is required to create the stable signing identity" >&2
+        exit 1
+    }
+    sign_dir="$install_root/signing"
+    keychain="$sign_dir/native-mac-rdp.keychain-db"
+    password_file="$sign_dir/keychain-password"
+    signing_name="NativeMacRDP Local Signing"
+
+    if [[ ! -f "$password_file" ]]; then
+        "$openssl_bin" rand -hex 24 > "$password_file"
+        /bin/chmod 600 "$password_file"
+    fi
+    keychain_password="$(<"$password_file")"
+
+    if [[ ! -f "$sign_dir/cert.p12" ]]; then
+        "$openssl_bin" req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout "$sign_dir/signing.key" \
+            -out "$sign_dir/signing.crt" \
+            -subj "/CN=$signing_name" \
+            -addext "basicConstraints=critical,CA:false" \
+            -addext "keyUsage=critical,digitalSignature" \
+            -addext "extendedKeyUsage=critical,codeSigning"
+        "$openssl_bin" pkcs12 -export -name "$signing_name" \
+            -inkey "$sign_dir/signing.key" -in "$sign_dir/signing.crt" \
+            -out "$sign_dir/cert.p12" \
+            -passout "pass:$keychain_password"
+        /bin/chmod 600 "$sign_dir/signing.key" "$sign_dir/cert.p12"
+    fi
+
+    if [[ ! -f "$keychain" ]]; then
+        /usr/bin/security create-keychain -p "$keychain_password" "$keychain"
+        /usr/bin/security set-keychain-settings "$keychain"
+        /usr/bin/security import "$sign_dir/cert.p12" -k "$keychain" \
+            -P "$keychain_password" -T /usr/bin/codesign -A
+    fi
+    /usr/bin/security unlock-keychain -p "$keychain_password" "$keychain"
+    /usr/bin/security set-key-partition-list \
+        -S apple-tool:,apple:,codesign: -s -k "$keychain_password" \
+        "$keychain" >/dev/null 2>&1 || true
+    /usr/bin/codesign --force --sign "$signing_name" --keychain "$keychain" \
+        --timestamp=none --identifier com.nativemacrdp.daemon "$binary"
+fi
+
+/usr/bin/codesign --verify --deep --strict "$binary"
+
+# The RDP transport certificate is separate from the executable signature.
+if [[ ! -f "$install_root/server.key" || ! -f "$install_root/server.crt" ]]; then
+    openssl_bin="${commands[openssl]:-}"
+    [[ -n "$openssl_bin" ]] || {
+        /bin/echo "openssl is required to generate the RDP TLS certificate" >&2
+        exit 1
+    }
+    "$openssl_bin" req -x509 -newkey rsa:2048 -nodes -days 3650 \
+        -keyout "$install_root/server.key" \
+        -out "$install_root/server.crt" \
+        -subj "/CN=$(/bin/hostname)"
+    /bin/chmod 600 "$install_root/server.key"
+fi
+
+# Generate the user-specific plist at install time; no home paths or signing
+# identities are committed to the repository.
+/bin/cat > "$agent" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>$LABEL</string>
+    <key>Label</key><string>$label</string>
     <key>ProgramArguments</key>
-    <array><string>$BIN</string><string>--port</string><string>$PORT</string></array>
+    <array>
+        <string>$binary</string>
+        <string>--bind-address</string><string>$bind_address</string>
+        <string>--port</string><string>$port</string>
+    </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
+    <key>LimitLoadToSessionType</key><string>Aqua</string>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>ThrottleInterval</key><integer>5</integer>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>RDP_CERT_DIR</key><string>$ROOT</string>
+        <key>RDP_CERT_DIR</key><string>$install_root</string>
         <key>RDP_LOG_LEVEL</key><string>info</string>
+        <key>RDP_DISPLAY_HELPER</key><string>$display_helper</string>
+        <key>RDP_BETTERDISPLAY_NAME</key><string>NativeMacRDP</string>
+        <key>RDP_NETWORK_AUTO_DETECT</key><string>1</string>
+        <key>RDP_CODEC_POLICY</key><string>progressive</string>
+        <key>RDP_PROGRESSIVE_MBIT</key><string>60</string>
+        <key>RDP_PROGRESSIVE_MIN_MBIT</key><string>2</string>
+        <key>RDP_RECONNECT_GRACE_SECONDS</key><string>30</string>
+        <key>RDP_CLIENT_LIVENESS_TIMEOUT_SECONDS</key><string>20</string>
+        <key>RDP_CURSOR_SHAPES</key><string>1</string>
+        <key>RDP_CURSOR_MODE</key><string>sanitized-native</string>
+        <key>RDP_CURSOR_POSITION_ECHO</key><string>buttons</string>
+        <key>RDP_SHOW_CURSOR</key><string>0</string>
+        <key>RDP_UNICODE_INPUT</key><string>1</string>
+        <key>RDP_SCROLL_PIXEL_SCALE</key><string>1.0</string>
+        <key>RDP_SHARED_MODE</key><string>1</string>
+        <key>RDP_ALLOW_IDLE_SLEEP</key><string>0</string>
+        <key>RDP_ADAPTIVE_FRAME_RATE</key><string>0</string>
+        <key>RDP_AUDIO_OUTPUT</key><string>$audio_output</string>
+        <key>RDP_AUDIO_LOCAL</key><string>$audio_local</string>
+        <key>RDP_AUDIO_LATENCY_MS</key><string>$audio_latency</string>
+        <key>RDP_AUDIO_INPUT</key><string>0</string>
+        <key>RDP_RDPDR_ENABLED</key><string>0</string>
+        <key>RDP_UDP_PROBE</key><string>$udp_enabled</string>
+        <key>RDP_UDP_MULTITRANSPORT</key><string>$udp_enabled</string>
+        <key>RDP_UDP_REQUIRE_COOKIE</key><string>1</string>
+        <key>RDP_UDP_FULL_STACK</key><string>$udp_enabled</string>
+        <key>RDP_UDP_HEXDUMP</key><string>0</string>
+        <key>RDP_UPDATE_ENABLED</key><string>0</string>
     </dict>
-    <key>StandardOutPath</key><string>$HOME/Library/Logs/macos-rdp-agent.log</string>
-    <key>StandardErrorPath</key><string>$HOME/Library/Logs/macos-rdp-agent.error.log</string>
-    <key>ThrottleInterval</key><integer>5</integer>
-    <key>ProcessType</key><string>Interactive</string>
-    <key>LimitLoadToSessionType</key><string>Aqua</string>
+    <key>StandardOutPath</key><string>$log_dir/native-mac-rdp.log</string>
+    <key>StandardErrorPath</key><string>$log_dir/native-mac-rdp.error.log</string>
 </dict>
 </plist>
-PL
+PLIST
 
-# 7. (Re)load the agent -----------------------------------------------------------------
-launchctl bootout "$GUI/$LABEL" 2>/dev/null || true
-launchctl enable "$GUI/$LABEL" 2>/dev/null || true   # clear any prior `disable` override
-launchctl bootstrap "$GUI" "$PLIST"
+/usr/bin/plutil -lint "$agent" >/dev/null
+/bin/launchctl enable "$gui/$label"
+/bin/launchctl bootstrap "$gui" "$agent"
 
-cat <<EOF
-
-Installed and running as $LABEL on port $PORT (user: $USER).
-
-ONE-TIME permission grant (durable afterwards — survives rebuilds):
-  1. Connect once from your RDP client to this Mac.
-  2. Approve the Screen Recording + Accessibility prompts, or enable
-     "macos-rdp-daemon" under System Settings > Privacy & Security.
-  3. Reconnect — the desktop will render.
-
-To deploy a new build later (no sudo, grant stays valid):
-  scripts/install-user.sh /path/to/new/macos-rdp-daemon
-EOF
+/bin/echo
+/bin/echo "NativeMacRDP is running on $bind_address:$port"
+/bin/echo "Transport:    TCP$([[ "$udp_enabled" == "1" ]] && /bin/echo ' + reliable UDP' || true)"
+/bin/echo "LaunchAgent: $label"
+/bin/echo "Executable:  $binary"
+/bin/echo
+/bin/echo "Approve Screen Recording and Accessibility for NativeMacRDP once,"
+/bin/echo "then restart with: launchctl kickstart -k $gui/$label"

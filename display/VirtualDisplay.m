@@ -1,6 +1,8 @@
 #import "display/VirtualDisplay.h"
 #import <CoreGraphics/CoreGraphics.h>
 #import <unistd.h>
+#import <stdlib.h>
+#import <stdint.h>
 #define RDP_LOG_COMPONENT "display"
 #include "logging/RDPLog.h"
 
@@ -9,6 +11,8 @@
 @property (nonatomic, assign) uint32_t w;
 @property (nonatomic, assign) uint32_t h;
 @property (nonatomic, assign) BOOL created;
+@property (nonatomic, copy) NSString *externalHelper;
+@property (nonatomic, assign) BOOL usingExternalDisplay;
 
 #if MACOS_RDP_VIRTUAL_DISPLAY
 /* Opaque pointers so the compiler doesn't need CGVirtualDisplay headers here.
@@ -25,6 +29,38 @@
 
 @implementation VirtualDisplay
 
+- (NSString *)runExternalHelperWithArguments:(NSArray<NSString *> *)arguments {
+    if (_externalHelper.length == 0) return nil;
+
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:_externalHelper];
+    task.arguments = arguments;
+    NSPipe *stdoutPipe = [NSPipe pipe];
+    NSPipe *stderrPipe = [NSPipe pipe];
+    task.standardOutput = stdoutPipe;
+    task.standardError = stderrPipe;
+
+    NSError *launchError = nil;
+    if (![task launchAndReturnError:&launchError]) {
+        rdp_error("display helper launch failed: %s",
+                  launchError.localizedDescription.UTF8String ?: "unknown");
+        return nil;
+    }
+    [task waitUntilExit];
+    NSData *stdoutData = [stdoutPipe.fileHandleForReading readDataToEndOfFile];
+    NSData *stderrData = [stderrPipe.fileHandleForReading readDataToEndOfFile];
+    NSString *stderrText = [[NSString alloc] initWithData:stderrData
+                                                encoding:NSUTF8StringEncoding];
+    if (task.terminationStatus != 0) {
+        rdp_error("display helper failed (%d): %s", task.terminationStatus,
+                  stderrText.UTF8String ?: "no detail");
+        return nil;
+    }
+    return [[[NSString alloc] initWithData:stdoutData
+                                  encoding:NSUTF8StringEncoding]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
 - (instancetype)initWithWidth:(uint32_t)width height:(uint32_t)height {
     if ((self = [super init])) {
         _w = width;
@@ -39,6 +75,32 @@
 
 - (BOOL)create {
     if (_created) return YES;
+
+    const char *helper = getenv("RDP_DISPLAY_HELPER");
+    if (helper && *helper) {
+        _externalHelper = [NSString stringWithUTF8String:helper];
+        NSString *didText = [self runExternalHelperWithArguments:@[
+            @"prepare", [NSString stringWithFormat:@"%u", _w],
+            [NSString stringWithFormat:@"%u", _h]
+        ]];
+        NSInteger did = didText.integerValue;
+        if (did > 0 && did <= UINT32_MAX) {
+            _did = (CGDirectDisplayID)did;
+            _usingExternalDisplay = YES;
+            _created = YES;
+            rdp_info("BetterDisplay session ready: displayID=%u %ux%u",
+                     _did, _w, _h);
+            return YES;
+        }
+
+        /* Fail safe: leave every display connected and capture the existing
+         * main display. Do not create a second private virtual display when the
+         * explicitly configured BetterDisplay integration fails. */
+        _did = CGMainDisplayID();
+        _created = YES;
+        rdp_error("BetterDisplay helper unavailable; using main display %u", _did);
+        return YES;
+    }
 
 #if MACOS_RDP_VIRTUAL_DISPLAY
     [self createVirtualDisplay];
@@ -57,13 +119,19 @@
 
 - (void)destroy {
     if (!_created) return;
+    if (_usingExternalDisplay) {
+        [self runExternalHelperWithArguments:@[@"restore"]];
+        _usingExternalDisplay = NO;
+    }
 #if MACOS_RDP_VIRTUAL_DISPLAY
-    /* Release in reverse dependency order: drop the display first (stops its
-     * listener thread), then the settings/mode/descriptor it referenced. */
-    _vdObject     = nil;
-    _vdSettings   = nil;
-    _vdMode       = nil;
-    _vdDescriptor = nil;
+    if (_vdObject) {
+        /* Release in reverse dependency order: drop the display first (stops its
+         * listener thread), then the settings/mode/descriptor it referenced. */
+        _vdObject     = nil;
+        _vdSettings   = nil;
+        _vdMode       = nil;
+        _vdDescriptor = nil;
+    }
 #endif
     _did = 0;
     _created = NO;
@@ -74,6 +142,38 @@
     _w = width;
     _h = height;
     rdp_verbose("resolution set to %ux%u (takes effect on next session)", width, height);
+}
+
+- (BOOL)resizeToWidth:(uint32_t)width height:(uint32_t)height {
+    if (!_created || width < 200 || height < 200 ||
+        width > 8192 || height > 8192 || (width & 1u))
+        return NO;
+    if (width == _w && height == _h) return YES;
+
+    if (_usingExternalDisplay) {
+        NSString *didText = [self runExternalHelperWithArguments:@[
+            @"prepare", [NSString stringWithFormat:@"%u", width],
+            [NSString stringWithFormat:@"%u", height]
+        ]];
+        NSInteger did = didText.integerValue;
+        if (did <= 0 || did > UINT32_MAX) {
+            rdp_error("BetterDisplay in-place resize failed: %ux%u", width, height);
+            return NO;
+        }
+        CGDirectDisplayID oldID = _did;
+        _did = (CGDirectDisplayID)did;
+        _w = width;
+        _h = height;
+        rdp_info("BetterDisplay resized in-place: displayID=%u%s %ux%u",
+                 _did, oldID == _did ? "" : " (displayID changed)", width, height);
+        return YES;
+    }
+
+    /* The entitlement-backed private display path currently has no guaranteed
+     * public in-place mode switch. Reject instead of silently rebuilding it;
+     * the deployed BetterDisplay path above is the supported dynamic route. */
+    rdp_error("in-place resize requires the configured BetterDisplay helper");
+    return NO;
 }
 
 #if MACOS_RDP_VIRTUAL_DISPLAY
