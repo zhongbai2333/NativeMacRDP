@@ -45,7 +45,7 @@ jobs:
           otool -L work/build-patched/daemon-build/macos-rdp-daemon
 
       - name: Upload daemon
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: NativeMacRDP-${{ runner.arch }}
           path: |
