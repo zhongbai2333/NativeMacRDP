@@ -54,7 +54,10 @@ static const uint32_t kDefaultBitrate = 8000;
 @property (nonatomic, strong, nullable) NSData *reconnectCookie;
 @property (nonatomic, strong) dispatch_semaphore_t resumeSem;
 @property (nonatomic, assign) BOOL explicitDisconnect;
-@property (nonatomic, assign) BOOL replacementDisconnect;
+/* RDP error-info sent for intentional closes. Authentication failures use
+ * FRESH_CREDENTIALS_REQUIRED so mstsc stops automatic reconnecting with an
+ * empty/cached credential set and returns to its credential UI. */
+@property (nonatomic, assign) uint32_t disconnectErrorInfo;
 @property (nonatomic, assign) BOOL retainedDesktopTransferred;
 @property (nonatomic, assign) RDPCursorPositionEchoMode cursorPositionEchoMode;
 - (BOOL)resizeDisplayToWidth:(uint32_t)width height:(uint32_t)height;
@@ -74,6 +77,7 @@ static const uint32_t kDefaultBitrate = 8000;
                                                 DISPATCH_QUEUE_SERIAL);
         _teardownSem    = dispatch_semaphore_create(0);
         _resumeSem      = dispatch_semaphore_create(0);
+        _disconnectErrorInfo = ERRINFO_RPC_INITIATED_DISCONNECT;
         _audioSendQueue = dispatch_queue_create("com.macosrdp.audio-send",
                                                 DISPATCH_QUEUE_SERIAL);
         /* Bound queued PCM to a short jitter window. The sender is no longer
@@ -529,13 +533,29 @@ static bool rdp_on_dvc_tunnel_send(void *ud, const uint8_t *data, size_t len) {
      * desktop creation is needed. A missing/invalid proof falls through to the
      * ordinary local-account authentication path. */
     BOOL resumed = NO;
+    BOOL reconnectAttempt = NO;
     ARC_CS_PRIVATE_PACKET incoming = {0};
     if (rdp_peer_get_incoming_reconnect_cookie(_peer, &incoming) &&
         [self.delegate respondsToSelector:
             @selector(session:requestResumeWithReconnectCookie:)]) {
+        reconnectAttempt = YES;
         NSData *proof = [NSData dataWithBytes:&incoming length:sizeof(incoming)];
         resumed = [self.delegate session:self
                requestResumeWithReconnectCookie:proof];
+    }
+
+    /* An ARC proof is only valid for the retained desktop that issued it. If a
+     * client was deliberately superseded, its automatic reconnect can race the
+     * replacement connection. Never turn that stale reconnect into a fresh,
+     * password-authenticated login: doing so lets two clients continuously
+     * evict each other. A genuinely new connection does not present ARC and
+     * still follows the ordinary authentication path below. */
+    if (reconnectAttempt && !resumed) {
+        rdp_info("stale auto-reconnect rejected for %s; a newer session owns the desktop",
+                 _address.UTF8String);
+        _explicitDisconnect = YES;
+        _sessionState = RDPSessionStateDisconnecting;
+        return;
     }
 
     /* ── Authenticate BEFORE creating any virtual display ─────────────────────
@@ -553,6 +573,8 @@ static bool rdp_on_dvc_tunnel_send(void *ud, const uint8_t *data, size_t len) {
         if (![Authenticator validateUsername:user password:pass domain:domain]) {
             rdp_error("authentication FAILED for %s (user='%s') — rejecting connection",
                       _address.UTF8String, user.length ? user.UTF8String : "(none)");
+            _disconnectErrorInfo = ERRINFO_SERVER_FRESH_CREDENTIALS_REQUIRED;
+            _explicitDisconnect = YES;
             _sessionState = RDPSessionStateDisconnecting;
             return;
         }
@@ -573,6 +595,7 @@ static bool rdp_on_dvc_tunnel_send(void *ud, const uint8_t *data, size_t len) {
                          @selector(sessionDidAuthenticateAndRequestActivation:)]) {
         if (![self.delegate sessionDidAuthenticateAndRequestActivation:self]) {
             rdp_info("activation refused for %s — aborting session", _address.UTF8String);
+            _explicitDisconnect = YES;
             _sessionState = RDPSessionStateDisconnecting;
             return;
         }
@@ -921,15 +944,29 @@ static bool rdp_on_dvc_tunnel_send(void *ud, const uint8_t *data, size_t len) {
     @synchronized(self) {
         if (_sessionState == RDPSessionStateDisconnected) return;
         _explicitDisconnect = YES;
-        _replacementDisconnect = YES;
         _sessionState = RDPSessionStateDisconnecting;
         fd = _fd;
         dispatch_semaphore_signal(_resumeSem);
     }
-    /* A graceful peer Close can block behind a client that stopped reading.
-     * Interrupt the socket first so the session queue reaches display teardown
-     * promptly. The fd remains owned by the session and is closed there. */
-    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    /* Let the peer loop reach teardown normally so it can send the protocol-
+     * level disconnect after video/audio producers have stopped. That tells
+     * mstsc this session was intentionally replaced instead of simulating a
+     * network outage (which triggers automatic reconnect and takeover ping-
+     * pong). Keep a bounded fallback for a peer stuck in a transport write. */
+    if (fd >= 0) {
+        __weak typeof(self) weak = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            typeof(self) strong = weak;
+            if (!strong) return;
+            @synchronized(strong) {
+                if (strong->_fd == fd &&
+                    strong->_sessionState != RDPSessionStateDisconnected)
+                    shutdown(fd, SHUT_RDWR);
+            }
+        });
+    }
 }
 
 - (BOOL)waitForTeardown:(NSTimeInterval)timeout {
@@ -957,9 +994,11 @@ static bool rdp_on_dvc_tunnel_send(void *ud, const uint8_t *data, size_t len) {
     /* A launchd reload is intentional, not a network interruption. Tell the
      * client at the RDP layer before destroying TLS so Windows App leaves the
      * old canvas immediately instead of waiting on its own transport timeout. */
-    if (_explicitDisconnect && !_replacementDisconnect && _peer)
-        (void)rdp_peer_close_gracefully(_peer,
-                                        ERRINFO_RPC_INITIATED_DISCONNECT);
+    if (_explicitDisconnect && _peer) {
+        rdp_info("closing RDP session intentionally with error-info 0x%08x",
+                 (unsigned)_disconnectErrorInfo);
+        (void)rdp_peer_close_gracefully(_peer, _disconnectErrorInfo);
+    }
 
     [_displayControl stop];
     [_display destroy];

@@ -65,8 +65,9 @@ typedef NS_ENUM(NSInteger, RDPSessionState) {
 - (void)disconnect;
 
 /* Superseding clients must release the shared BetterDisplay promptly. This
- * variant shuts down the old transport to interrupt a blocked writer and skips
- * the best-effort graceful-close PDU during teardown. */
+ * variant sends an intentional RDP disconnect so the old client does not treat
+ * replacement as a network outage and automatically reconnect. A bounded
+ * socket-shutdown fallback still interrupts a blocked transport. */
 - (void)disconnectForReplacement;
 
 /* Block the calling thread until this session's teardown has fully completed
