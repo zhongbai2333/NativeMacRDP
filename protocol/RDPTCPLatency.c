@@ -148,6 +148,14 @@ uint32_t rdp_tcp_latency_latest_feedback_frame(uint32_t qoeFrame,
     return (int32_t)(frameAck - qoeFrame) > 0 ? frameAck : qoeFrame;
 }
 
+uint32_t rdp_tcp_latency_rate_feedback_ms(uint32_t qoeFeedbackMS,
+                                          uint32_t frameAckFeedbackMS,
+                                          bool exactFrameAckSeen) {
+    if (exactFrameAckSeen && frameAckFeedbackMS)
+        return frameAckFeedbackMS;
+    return qoeFeedbackMS;
+}
+
 static RDPTCPLatencyAdjustment reduce_rate(
     RDPTCPLatencyController *controller, uint64_t nowMS, uint32_t percent,
     RDPTCPLatencyCause cause) {

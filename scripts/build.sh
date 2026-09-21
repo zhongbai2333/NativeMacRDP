@@ -15,6 +15,7 @@ freerdp_install="$build_root/freerdp-install"
 daemon_build="$build_root/daemon-build"
 freerdp_patch="$repo_root/patches/freerdp-3.30.0-macos-rdp-udp.patch"
 quality_patch="$repo_root/patches/freerdp-3.30.0-progressive-quality.patch"
+rdpedisp_patch="$repo_root/patches/freerdp-3.30.0-rdpedisp-liveness.patch"
 expected_sha256="21b3f72bd688fcd1dbbef37b7129bfc9701906705572fce2a5a80b1e85ecc0ee"
 
 cmake_bin="${commands[cmake]:-}"
@@ -25,6 +26,7 @@ brew_bin="${commands[brew]:-}"
 [[ -n "$brew_bin" ]] || { /bin/echo "Homebrew is required" >&2; exit 1; }
 [[ -f "$freerdp_patch" ]] || { /bin/echo "missing patch: $freerdp_patch" >&2; exit 1; }
 [[ -f "$quality_patch" ]] || { /bin/echo "missing patch: $quality_patch" >&2; exit 1; }
+[[ -f "$rdpedisp_patch" ]] || { /bin/echo "missing patch: $rdpedisp_patch" >&2; exit 1; }
 
 brew_prefix="${NATIVE_MAC_RDP_HOMEBREW_PREFIX:-$($brew_bin --prefix)}"
 openssl_root="${OPENSSL_ROOT_DIR:-$($brew_bin --prefix openssl@3)}"
@@ -56,6 +58,10 @@ fi
 if ! /usr/bin/grep -q "progressive_context_set_quantization" \
         "$freerdp_source/include/freerdp/codec/progressive.h"; then
     /usr/bin/patch --forward -p1 -d "$freerdp_source" < "$quality_patch"
+fi
+if ! /usr/bin/grep -q "RDPEDISP receive thread started" \
+        "$freerdp_source/channels/disp/server/disp_main.c"; then
+    /usr/bin/patch --forward -p1 -d "$freerdp_source" < "$rdpedisp_patch"
 fi
 
 pkg_config_path="$brew_prefix/lib/pkgconfig:$openssl_root/lib/pkgconfig"

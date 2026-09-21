@@ -130,6 +130,12 @@ struct rdp_peer_context {
     _Atomic uint64_t     qoeSendTimesMS[RDP_QOE_SEND_HISTORY];
     _Atomic uint32_t     qoeSendSizes[RDP_QOE_SEND_HISTORY];
     _Atomic uint32_t     qoeSendFrameIds[RDP_QOE_SEND_HISTORY];
+    /* Ordinary decoded-frame ACK timestamps use the same frame-ID slots. QoE
+     * may arrive much later; matching by frame ID prevents a newer ACK from
+     * being paired with an older QoE sample. The frame ID is the publication
+     * word and is reset whenever its circular slot is reused. */
+    _Atomic uint64_t     frameAckTimesMS[RDP_QOE_SEND_HISTORY];
+    _Atomic uint32_t     frameAckFrameIds[RDP_QOE_SEND_HISTORY];
     _Atomic bool         gfxAckSeen;
     _Atomic bool         gfxAckSuspended;
     _Atomic uint64_t     progressiveAckDrops;
@@ -193,7 +199,8 @@ struct rdp_peer_context {
      * the loop already holds it. */
     pthread_mutex_t      xportLock;
     bool                 gfxOpened;  /* GFX DVC Open() succeeded (drdynvc ready) */
-    bool                 dispOpened; /* MS-RDPEDISP DVC opened and caps sent */
+    bool                 dispOpened;   /* MS-RDPEDISP DVC create request sent */
+    bool                 dispCapsSent; /* DVC ready and server caps delivered */
     bool                 gfxReady;   /* client sent GFX caps; surface mapped */
     uint32_t             gfxChannelId;
     _Atomic bool         udpTunnelReady;

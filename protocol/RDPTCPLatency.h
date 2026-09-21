@@ -97,6 +97,14 @@ uint32_t rdp_tcp_latency_latest_feedback_frame(uint32_t qoeFrame,
                                                uint32_t frameAck,
                                                bool frameAckSeen);
 
+/* mstsc can batch QoE acknowledgements for hundreds of milliseconds even
+ * though its ordinary ACK for the same decoded frame arrived promptly. Prefer
+ * that exact-frame ACK as the TCP transport sample; QoE decode/render fields
+ * remain useful independently. */
+uint32_t rdp_tcp_latency_rate_feedback_ms(uint32_t qoeFeedbackMS,
+                                          uint32_t frameAckFeedbackMS,
+                                          bool exactFrameAckSeen);
+
 RDPTCPLatencyAdjustment rdp_tcp_latency_on_feedback(
     RDPTCPLatencyController *controller,
     uint32_t feedbackElapsedMS,

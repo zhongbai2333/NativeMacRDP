@@ -1,0 +1,252 @@
+--- a/channels/disp/server/disp_main.h
++++ b/channels/disp/server/disp_main.h
+@@ -25,6 +25,7 @@
+ struct s_disp_server_private
+ {
+ 	BOOL isReady;
++	BOOL ownThread;
+ 	wStream* input_stream;
+ 	HANDLE channelEvent;
+ 	HANDLE thread;
+--- a/include/freerdp/server/disp.h
++++ b/include/freerdp/server/disp.h
+@@ -40,6 +40,7 @@
+ 	typedef UINT (*psDispCaps)(DispServerContext* context);
+ 	typedef UINT (*psDispOpen)(DispServerContext* context);
+ 	typedef UINT (*psDispClose)(DispServerContext* context);
++	typedef BOOL (*psDispInitialize)(DispServerContext* context, BOOL externalThread);
+ 
+ 	struct s_disp_server_context
+ 	{
+@@ -53,6 +54,7 @@
+ 
+ 		WINPR_ATTR_NODISCARD psDispOpen Open;
+ 		WINPR_ATTR_NODISCARD psDispClose Close;
++		WINPR_ATTR_NODISCARD psDispInitialize Initialize;
+ 
+ 		WINPR_ATTR_NODISCARD psDispMonitorLayout DispMonitorLayout;
+ 		WINPR_ATTR_NODISCARD psDispCaps DisplayControlCaps;
+@@ -72,6 +74,12 @@
+ 	WINPR_ATTR_NODISCARD
+ 	FREERDP_API DispServerContext* disp_server_context_new(HANDLE vcm);
+ 
++	WINPR_ATTR_NODISCARD
++	FREERDP_API HANDLE disp_server_get_event_handle(DispServerContext* context);
++
++	WINPR_ATTR_NODISCARD
++	FREERDP_API UINT disp_server_handle_messages(DispServerContext* context);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/channels/disp/server/disp_main.c
++++ b/channels/disp/server/disp_main.c
+@@ -146,6 +146,9 @@
+ 
+ 	Stream_Read_UINT32(s, pdu.NumMonitors); /* NumMonitors (4 bytes) */
+ 
++	WLog_INFO(TAG, "RDPEDISP monitor layout received: size=%" PRIu32 " monitors=%" PRIu32,
++	          pdu.MonitorLayoutSize, pdu.NumMonitors);
++
+ 	if (pdu.NumMonitors > context->MaxNumMonitors)
+ 	{
+ 		WLog_ERR(TAG, "NumMonitors (%" PRIu32 ")> server MaxNumMonitors (%" PRIu32 ")",
+@@ -185,12 +188,12 @@
+ 		Stream_Read_UINT32(s, monitor->DeviceScaleFactor);  /* DeviceScaleFactor (4 bytes) */
+ 
+ 		disp_server_sanitize_monitor_layout(monitor);
+-		WLog_DBG(TAG,
++		WLog_INFO(TAG,
+ 		         "\t%" PRIu32 " : Flags: 0x%08" PRIX32 " Left/Top: (%" PRId32 ",%" PRId32
+ 		         ") W/H=%" PRIu32 "x%" PRIu32 ")",
+ 		         index, monitor->Flags, monitor->Left, monitor->Top, monitor->Width,
+ 		         monitor->Height);
+-		WLog_DBG(TAG,
++		WLog_INFO(TAG,
+ 		         "\t   PhysicalWidth: %" PRIu32 " PhysicalHeight: %" PRIu32 " Orientation: %" PRIu32
+ 		         "",
+ 		         monitor->PhysicalWidth, monitor->PhysicalHeight, monitor->Orientation);
+@@ -258,10 +261,37 @@
+ 	return error;
+ }
+ 
+-static UINT disp_server_handle_messages(DispServerContext* context)
++static UINT disp_server_ensure_channel_ready(DispServerContext* context)
+ {
+ 	DWORD BytesReturned = 0;
+ 	void* buffer = nullptr;
++
++	WINPR_ASSERT(context);
++	DispServerPrivate* priv = context->priv;
++	WINPR_ASSERT(priv);
++
++	if (priv->isReady)
++		return CHANNEL_RC_OK;
++
++	if (WTSVirtualChannelQuery(priv->disp_channel, WTSVirtualChannelReady, &buffer,
++	                           &BytesReturned) == FALSE)
++	{
++		if (GetLastError() == ERROR_NO_DATA)
++			return ERROR_NO_DATA;
++
++		WLog_ERR(TAG, "WTSVirtualChannelQuery failed");
++		return ERROR_INTERNAL_ERROR;
++	}
++
++	priv->isReady = *((BOOL*)buffer);
++	WTSFreeMemory(buffer);
++	WLog_INFO(TAG, "RDPEDISP dynamic channel ready=%" PRId32, priv->isReady);
++	return priv->isReady ? CHANNEL_RC_OK : ERROR_NO_DATA;
++}
++
++UINT disp_server_handle_messages(DispServerContext* context)
++{
++	DWORD BytesReturned = 0;
+ 	UINT ret = CHANNEL_RC_OK;
+ 	DispServerPrivate* priv = nullptr;
+ 	wStream* s = nullptr;
+@@ -274,22 +304,9 @@
+ 	s = priv->input_stream;
+ 	WINPR_ASSERT(s);
+ 
+-	/* Check whether the dynamic channel is ready */
+-	if (!priv->isReady)
+-	{
+-		if (WTSVirtualChannelQuery(priv->disp_channel, WTSVirtualChannelReady, &buffer,
+-		                           &BytesReturned) == FALSE)
+-		{
+-			if (GetLastError() == ERROR_NO_DATA)
+-				return ERROR_NO_DATA;
+-
+-			WLog_ERR(TAG, "WTSVirtualChannelQuery failed");
+-			return ERROR_INTERNAL_ERROR;
+-		}
+-
+-		priv->isReady = *((BOOL*)buffer);
+-		WTSFreeMemory(buffer);
+-	}
++	ret = disp_server_ensure_channel_ready(context);
++	if (ret != CHANNEL_RC_OK)
++		return ret;
+ 
+ 	/* Consume channel event only after the disp dynamic channel is ready */
+ 	Stream_ResetPosition(s);
+@@ -360,6 +377,8 @@
+ 	events[nCount++] = priv->stopEvent;
+ 	events[nCount++] = priv->channelEvent;
+ 
++	WLog_INFO(TAG, "RDPEDISP receive thread started");
++
+ 	/* Main virtual channel loop. RDPEDISP do not need version negotiation */
+ 	while (TRUE)
+ 	{
+@@ -376,13 +395,34 @@
+ 		if (status == WAIT_OBJECT_0)
+ 			break;
+ 
+-		if ((error = disp_server_handle_messages(context)))
++		error = disp_server_handle_messages(context);
++		if (error == ERROR_NO_DATA)
++		{
++			/* A newly opened DVC can signal its event before the channel-ready
++			 * transition or before a complete PDU is readable.  ERROR_NO_DATA is
++			 * therefore transient.  Exiting here leaves the channel apparently
++			 * open while silently discarding every later monitor-layout PDU. */
++			error = CHANNEL_RC_OK;
++			status = WaitForSingleObject(priv->stopEvent, 10);
++			if (status == WAIT_OBJECT_0)
++				break;
++			if (status == WAIT_FAILED)
++			{
++				error = GetLastError();
++				WLog_ERR(TAG, "RDPEDISP retry wait failed with error %" PRIu32, error);
++				break;
++			}
++			continue;
++		}
++
++		if (error != CHANNEL_RC_OK)
+ 		{
+ 			WLog_ERR(TAG, "disp_server_handle_messages failed with error %" PRIu32 "", error);
+ 			break;
+ 		}
+ 	}
+ 
++	WLog_INFO(TAG, "RDPEDISP receive thread stopped with status %" PRIu32, error);
+ 	ExitThread(error);
+ 	return error;
+ }
+@@ -459,7 +499,7 @@
+ 	priv->channelEvent = *(HANDLE*)buffer;
+ 	WTSFreeMemory(buffer);
+ 
+-	if (priv->thread == nullptr)
++	if (priv->ownThread && priv->thread == nullptr)
+ 	{
+ 		if (!(priv->stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr)))
+ 		{
+@@ -526,8 +566,12 @@
+ static UINT disp_server_send_caps_pdu(DispServerContext* context)
+ {
+ 	wStream* s = nullptr;
++	UINT error = CHANNEL_RC_OK;
+ 
+ 	WINPR_ASSERT(context);
++	error = disp_server_ensure_channel_ready(context);
++	if (error != CHANNEL_RC_OK)
++		return error;
+ 
+ 	s = disp_server_single_packet_new(DISPLAY_CONTROL_PDU_TYPE_CAPS, 12);
+ 
+@@ -558,7 +602,7 @@
+ 	priv = context->priv;
+ 	WINPR_ASSERT(priv);
+ 
+-	if (priv->thread)
++	if (priv->ownThread && priv->thread)
+ 	{
+ 		(void)SetEvent(priv->stopEvent);
+ 
+@@ -584,6 +628,21 @@
+ 	return error;
+ }
+ 
++static BOOL disp_server_initialize(DispServerContext* context, BOOL externalThread)
++{
++	WINPR_ASSERT(context);
++	WINPR_ASSERT(context->priv);
++
++	if (context->priv->disp_channel)
++	{
++		WLog_WARN(TAG, "RDPEDISP channel already opened; thread mode cannot be changed");
++		return FALSE;
++	}
++
++	context->priv->ownThread = !externalThread;
++	return TRUE;
++}
++
+ DispServerContext* disp_server_context_new(HANDLE vcm)
+ {
+ 	DispServerContext* context = nullptr;
+@@ -615,7 +674,9 @@
+ 	context->vcm = vcm;
+ 	context->Open = disp_server_open;
+ 	context->Close = disp_server_close;
++	context->Initialize = disp_server_initialize;
+ 	context->DisplayControlCaps = disp_server_send_caps_pdu;
++	priv->ownThread = TRUE;
+ 	priv->isReady = FALSE;
+ 	return context;
+ fail:
+@@ -640,3 +701,10 @@
+ 
+ 	free(context);
+ }
++
++HANDLE disp_server_get_event_handle(DispServerContext* context)
++{
++	if (!context || !context->priv)
++		return nullptr;
++	return context->priv->channelEvent;
++}

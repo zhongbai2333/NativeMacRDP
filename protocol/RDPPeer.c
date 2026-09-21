@@ -784,11 +784,14 @@ static void peer_apply_settings(freerdp_peer *peer) {
     freerdp_settings_set_bool(s,   FreeRDP_HasHorizontalWheel,      TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_HasExtendedMouseEvent,   TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_SoundBeepsEnabled,       FALSE);
-    /* Accept multi-monitor connections: client may send monitor layout data
-     * (e.g. "Use all my monitors" in mstsc). We create one virtual display
-     * sized to the combined DesktopWidth × DesktopHeight, which covers both
-     * the span case and the independent-monitor case from the server's side. */
-    freerdp_settings_set_bool(s,   FreeRDP_UseMultimon,             TRUE);
+    /* Do not force UseMultimon in server mode. That setting describes a
+     * client-supplied monitor topology, not server support for RDPEDISP. When
+     * a windowed client supplies no TS_UD_CS_MONITOR block, forcing it leaves
+     * FreeRDP in the contradictory state UseMultimon=TRUE/MonitorCount=0.
+     * Windows App then keeps the DISP DVC open but can suppress its single-
+     * monitor layout updates. SupportMonitorLayoutPdu remains enabled so a
+     * client that actually supplies the legacy monitor-layout capability can
+     * still negotiate it; dynamic window resizing uses MS-RDPEDISP below. */
     freerdp_settings_set_bool(s,   FreeRDP_SupportMonitorLayoutPdu, TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_DesktopResize,            TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_SupportDisplayControl,    TRUE);
@@ -1371,6 +1374,21 @@ static UINT gfx_frame_acknowledge(
                           ack->queueDepth == SUSPEND_FRAME_ACKNOWLEDGEMENT,
                           memory_order_release);
 
+    /* Record the ordinary decoded-frame ACK for this exact frame. mstsc often
+     * emits this promptly but batches its QoE ACK for 300-1000 ms. Pairing the
+     * two later lets TCP pacing distinguish network delivery from QoE report
+     * cadence without relying on socket writability or client identity. */
+    if (ack->queueDepth != SUSPEND_FRAME_ACKNOWLEDGEMENT) {
+        const uint32_t slot = ack->frameId % RDP_QOE_SEND_HISTORY;
+        if (atomic_load_explicit(&ctx->qoeSendFrameIds[slot],
+                                 memory_order_acquire) == ack->frameId) {
+            atomic_store_explicit(&ctx->frameAckTimesMS[slot], nowMS,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&ctx->frameAckFrameIds[slot], ack->frameId,
+                                  memory_order_release);
+        }
+    }
+
     uint32_t lastFrameBytes = atomic_load_explicit(
         &ctx->progressiveLastFrameBytes, memory_order_relaxed);
     uint32_t congestionThreshold = lastFrameBytes > 0
@@ -1489,15 +1507,28 @@ static UINT gfx_qoe_frame_acknowledge(
                           memory_order_release);
     const uint32_t slot = qoe->frameId % RDP_QOE_SEND_HISTORY;
     uint32_t feedbackMS = 0;
+    uint32_t frameAckFeedbackMS = 0;
     uint32_t frameBytes = 0;
+    bool exactFrameAckSeen = false;
+    uint64_t sentMS = 0;
     if (atomic_load_explicit(&ctx->qoeSendFrameIds[slot],
                              memory_order_acquire) == qoe->frameId) {
-        const uint64_t sentMS = atomic_load_explicit(
+        sentMS = atomic_load_explicit(
             &ctx->qoeSendTimesMS[slot], memory_order_relaxed);
         frameBytes = atomic_load_explicit(&ctx->qoeSendSizes[slot],
                                           memory_order_relaxed);
         if (sentMS && nowMS >= sentMS && nowMS - sentMS <= UINT32_MAX)
             feedbackMS = (uint32_t)(nowMS - sentMS);
+        if (atomic_load_explicit(&ctx->frameAckFrameIds[slot],
+                                 memory_order_acquire) == qoe->frameId) {
+            const uint64_t ackMS = atomic_load_explicit(
+                &ctx->frameAckTimesMS[slot], memory_order_relaxed);
+            if (sentMS && ackMS >= sentMS &&
+                ackMS - sentMS <= UINT32_MAX) {
+                frameAckFeedbackMS = (uint32_t)(ackMS - sentMS);
+                exactFrameAckSeen = frameAckFeedbackMS > 0u;
+            }
+        }
     }
     const uint32_t previousQoeFrame = atomic_load_explicit(
         &ctx->lastQoeFrameId, memory_order_relaxed);
@@ -1519,9 +1550,16 @@ static UINT gfx_qoe_frame_acknowledge(
                                                       memory_order_release) + 1u;
     const RDPTransportFeedback transport = peer_udp_transport_feedback(
         ctx, nowMS);
+    /* Reliable UDP has its own RTT/loss/queue evidence. On TCP, use the
+     * ordinary ACK for this same frame when available: QoE elapsed time then
+     * describes mstsc's reporting cadence, not transport congestion. */
+    const uint32_t rateFeedbackMS = transport.reliableUDPActive
+        ? feedbackMS
+        : rdp_tcp_latency_rate_feedback_ms(
+              feedbackMS, frameAckFeedbackMS, exactFrameAckSeen);
     const RDPTCPLatencyAdjustment adjustment =
         rdp_tcp_latency_on_feedback_with_transport(
-            &ctx->tcpLatency, feedbackMS, frameBytes, qoe->timeDiffSE,
+            &ctx->tcpLatency, rateFeedbackMS, frameBytes, qoe->timeDiffSE,
             qoe->timeDiffEDR, &transport, count, nowMS);
     peer_adapt_udp_frame_rate(ctx, &transport,
                               (uint32_t)qoe->timeDiffSE + qoe->timeDiffEDR);
@@ -1535,13 +1573,17 @@ static UINT gfx_qoe_frame_acknowledge(
                               ctx->tcpLatency.currentBytesPerSec,
                               memory_order_release);
         rdp_info("Progressive %s feedback %s: reason=%s sample=%u ms "
+                 "qoe=%u ms source=%s "
                  "smoothed=%u ms target=%.1f/%.1f Mbit/s confirmed=%.1f "
                  "Mbit/s transport-rtt=%ums inflight=%u/%u queued=%u",
                  transport.reliableUDPActive ? "UDP" : "TCP",
                  adjustmentName,
                  latency_adjustment_cause_name(
                      ctx->tcpLatency.lastAdjustmentCause),
-                 feedbackMS, ctx->tcpLatency.smoothedFeedbackMS,
+                 rateFeedbackMS, feedbackMS,
+                 (!transport.reliableUDPActive && exactFrameAckSeen)
+                     ? "frame-ack" : "qoe",
+                 ctx->tcpLatency.smoothedFeedbackMS,
                  (double)ctx->tcpLatency.currentBytesPerSec * 8.0 / 1000000.0,
                  (double)ctx->tcpLatency.measuredCeilingBytesPerSec * 8.0 /
                      1000000.0,
@@ -1556,8 +1598,12 @@ static UINT gfx_qoe_frame_acknowledge(
     if ((count % cadence) == 0u || qoe->timeDiffSE >= 50u ||
         qoe->timeDiffEDR >= 50u || adjustment != RDPTCPLatencyUnchanged) {
         rdp_info("GFX QoE: frame=%u bytes=%u client-ts=%u feedback=%ums "
-                 "smoothed=%ums decode-span=%ums render=%ums",
+                 "rate-feedback=%ums source=%s smoothed=%ums "
+                 "decode-span=%ums render=%ums",
                  qoe->frameId, frameBytes, qoe->timestamp, feedbackMS,
+                 rateFeedbackMS,
+                 (!transport.reliableUDPActive && exactFrameAckSeen)
+                     ? "frame-ack" : "qoe",
                  ctx->tcpLatency.smoothedFeedbackMS, qoe->timeDiffSE,
                  qoe->timeDiffEDR);
     }
@@ -1727,9 +1773,22 @@ static UINT disp_monitor_layout(DispServerContext *disp,
     if (spanWidth < DISPLAY_CONTROL_MIN_MONITOR_WIDTH ||
         spanWidth > DISPLAY_CONTROL_MAX_MONITOR_WIDTH ||
         spanHeight < DISPLAY_CONTROL_MIN_MONITOR_HEIGHT ||
-        spanHeight > DISPLAY_CONTROL_MAX_MONITOR_HEIGHT ||
-        (spanWidth & 1) != 0)
+        spanHeight > DISPLAY_CONTROL_MAX_MONITOR_HEIGHT)
         return ERROR_INVALID_DATA;
+
+    /* RDPEDISP permits odd monitor widths, and mobile/windowed clients often
+     * report one (for example after FRP/WAN scaling).  The BetterDisplay and
+     * RDPGFX paths require an even desktop width, so normalize instead of
+     * rejecting an otherwise valid layout.  The protocol maximum is even, so
+     * rounding up is always safe here and avoids clipping the rightmost pixel.
+     */
+    if (spanWidth & 1) {
+        if (spanWidth == DISPLAY_CONTROL_MAX_MONITOR_WIDTH)
+            return ERROR_INVALID_DATA;
+        spanWidth++;
+        rdp_verbose("RDPEDISP normalized odd desktop width to %lldx%lld",
+                    (long long)spanWidth, (long long)spanHeight);
+    }
 
     uint64_t packed = ((uint64_t)(uint32_t)spanWidth << 32) |
                       (uint32_t)spanHeight;
@@ -2541,16 +2600,26 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     rdp_verbose("GFX context created (external-thread mode); open deferred");
 
     /* MS-RDPEDISP is another DVC and therefore also waits for drdynvc READY.
-     * Its FreeRDP server context owns a small receive thread; the callback only
-     * publishes the newest requested size atomically. The peer/session loop
-     * performs all macOS and RDPGFX mutations in-order under xportLock. */
+     * Keep it in external-thread mode just like GFX: the peer/session loop
+     * pumps both DVCs under xportLock, and the display callback only publishes
+     * the newest requested size atomically. */
     ctx->disp = disp_server_context_new(ctx->vcm);
     if (ctx->disp) {
+        if (ctx->disp->Initialize && !ctx->disp->Initialize(ctx->disp, TRUE)) {
+            rdp_error("Display Control external-thread initialization failed");
+            disp_server_context_free(ctx->disp);
+            ctx->disp = NULL;
+            return FALSE;
+        }
         ctx->disp->custom = ctx;
         ctx->disp->rdpcontext = peer->context;
         ctx->disp->MaxNumMonitors = 16;
-        ctx->disp->MaxMonitorAreaFactorA = 8192;
-        ctx->disp->MaxMonitorAreaFactorB = 8192;
+        /* Match xrdp's long-established MS-RDPEDISP capability values. The
+         * client treats these as constraints on every later Monitor Layout
+         * PDU, so use the known-compatible values instead of advertising a
+         * much larger, untested area (8192 x 8192 per monitor). */
+        ctx->disp->MaxMonitorAreaFactorA = 4096;
+        ctx->disp->MaxMonitorAreaFactorB = 2048;
         ctx->disp->DispMonitorLayout = disp_monitor_layout;
         rdp_verbose("Display Control context created; open deferred");
     } else {
@@ -2781,6 +2850,7 @@ static bool peer_publish_auto_reconnect_cookie(freerdp_peer *peer,
 
 static BOOL peer_activate(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    const bool wasActivated = ctx->activated;
     ctx->activated = true;
     atomic_store_explicit(&ctx->lastClientResponseMS, GetTickCount64(),
                           memory_order_release);
@@ -2788,7 +2858,50 @@ static BOOL peer_activate(freerdp_peer *peer) {
     UINT32 w = freerdp_settings_get_uint32(s, FreeRDP_DesktopWidth);
     UINT32 h = freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight);
     UINT32 d = freerdp_settings_get_uint32(s, FreeRDP_ColorDepth);
+    const char *clientHostname =
+        freerdp_settings_get_string(s, FreeRDP_ClientHostname);
     rdp_info("peer activated: %ux%u @%ubpp", w, h, d);
+    rdp_info("client identity/display: host=%s build=%u os=%u.%u "
+             "physical=%ux%umm scale=%u%% device-scale=%u%%",
+             clientHostname ? clientHostname : "(not supplied)",
+             freerdp_settings_get_uint32(s, FreeRDP_ClientBuild),
+             freerdp_settings_get_uint32(s, FreeRDP_OsMajorType),
+             freerdp_settings_get_uint32(s, FreeRDP_OsMinorType),
+             freerdp_settings_get_uint32(s, FreeRDP_DesktopPhysicalWidth),
+             freerdp_settings_get_uint32(s, FreeRDP_DesktopPhysicalHeight),
+             freerdp_settings_get_uint32(s, FreeRDP_DesktopScaleFactor),
+             freerdp_settings_get_uint32(s, FreeRDP_DeviceScaleFactor));
+    rdp_info("display negotiation: resize=%d display-control=%d dynamic=%d "
+             "multimon=%d span=%d monitor-layout=%d monitors=%u",
+             freerdp_settings_get_bool(s, FreeRDP_DesktopResize),
+             freerdp_settings_get_bool(s, FreeRDP_SupportDisplayControl),
+             freerdp_settings_get_bool(s, FreeRDP_DynamicResolutionUpdate),
+             freerdp_settings_get_bool(s, FreeRDP_UseMultimon),
+             freerdp_settings_get_bool(s, FreeRDP_SpanMonitors),
+             freerdp_settings_get_bool(s, FreeRDP_SupportMonitorLayoutPdu),
+             (unsigned)freerdp_settings_get_uint32(s, FreeRDP_MonitorCount));
+
+    /* Some clients (and some transports/proxies) report a window resize as a
+     * core re-activation instead of sending MS-RDPEDISP.  Activate is allowed
+     * to run again for that case; do not let RDPSession's one-time onReady path
+     * discard the new dimensions.  Queue the same ordered resize used by the
+     * display-control channel so capture, BetterDisplay and RDPGFX are updated
+     * together on the peer loop.
+     */
+    if (wasActivated && w >= DISPLAY_CONTROL_MIN_MONITOR_WIDTH &&
+        w <= DISPLAY_CONTROL_MAX_MONITOR_WIDTH &&
+        h >= DISPLAY_CONTROL_MIN_MONITOR_HEIGHT &&
+        h <= DISPLAY_CONTROL_MAX_MONITOR_HEIGHT) {
+        uint32_t normalizedWidth = (w & 1u) ? w + 1u : w;
+        if (normalizedWidth <= DISPLAY_CONTROL_MAX_MONITOR_WIDTH &&
+            (normalizedWidth != ctx->surfaceWidth || h != ctx->surfaceHeight)) {
+            uint64_t packed = ((uint64_t)normalizedWidth << 32) | h;
+            atomic_store_explicit(&ctx->pendingDisplaySize, packed,
+                                  memory_order_release);
+            rdp_info("core re-activation resize queued: %ux%u",
+                     normalizedWidth, h);
+        }
+    }
     rdp_info("pointer caps: colorCache=%u pointerCache=%u large=0x%08x",
              freerdp_settings_get_uint32(s, FreeRDP_ColorPointerCacheSize),
              freerdp_settings_get_uint32(s, FreeRDP_PointerCacheSize),
@@ -2983,7 +3096,7 @@ bool rdp_peer_close_gracefully(freerdp_peer *peer, uint32_t errorInfo) {
 bool rdp_peer_run_once(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
 
-    HANDLE events[70] = {0};   /* transport(64) + vcm + gfx + clip + rdpdr + ai_input + spare */
+    HANDLE events[70] = {0};   /* transport(64) + vcm + gfx + disp + clip + rdpdr + ai_input + spare */
     DWORD  nCount = 0;
 
     /* Peer transport events (typically 1-2 handles). */
@@ -2999,6 +3112,15 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
     if (ctx->gfx && ctx->gfxOpened) {
         HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
         if (gfxEvent) events[nCount++] = gfxEvent;
+    }
+
+    /* Drive Display Control from this same serialized event loop. FreeRDP's
+     * default private DISP thread can miss its ready transition across rapid
+     * reconnect/takeover cycles, leaving the channel apparently open while no
+     * monitor-layout PDUs are consumed. */
+    if (ctx->disp && ctx->dispOpened) {
+        HANDLE dispEvent = disp_server_get_event_handle(ctx->disp);
+        if (dispEvent) events[nCount++] = dispEvent;
     }
 
     /* Clipboard channel event. cliprdr is a STATIC virtual channel opened in
@@ -3111,15 +3233,27 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         UINT drc = ctx->disp->Open(ctx->disp);
         if (drc == CHANNEL_RC_OK) {
             ctx->dispOpened = true;
-            drc = ctx->disp->DisplayControlCaps(ctx->disp);
-            if (drc == CHANNEL_RC_OK)
-                rdp_info("MS-RDPEDISP channel opened; dynamic resolution ready");
-            else {
-                rdp_error("MS-RDPEDISP capability send failed: %u", drc);
-                ok = false;
-            }
+            rdp_info("MS-RDPEDISP channel create requested; waiting for client confirmation");
         } else {
             rdp_error("MS-RDPEDISP Open failed despite drdynvc ready: %u", drc);
+        }
+    }
+
+    /* WTSVirtualChannelOpenEx only sends the DVC create request.  It does not
+     * mean the client has accepted the channel yet.  Sending Display Control
+     * capabilities before DVC_OPEN_STATE_SUCCEEDED is a race: the write can
+     * appear successful while the client never receives the caps, so it never
+     * sends a Monitor Layout PDU.  Poll the cheap readiness query and send the
+     * caps exactly once after the create response has been processed. */
+    if (ok && ctx->disp && ctx->dispOpened && !ctx->dispCapsSent) {
+        UINT drc = ctx->disp->DisplayControlCaps(ctx->disp);
+        if (drc == CHANNEL_RC_OK) {
+            ctx->dispCapsSent = true;
+            rdp_info("MS-RDPEDISP channel ready; capabilities sent "
+                     "(monitors=16 area=4096x2048)");
+        } else if (drc != ERROR_NO_DATA) {
+            rdp_error("MS-RDPEDISP capability send failed: %u", drc);
+            ok = false;
         }
     }
 
@@ -3128,6 +3262,21 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
         if (gfxEvent && WaitForSingleObject(gfxEvent, 0) == WAIT_OBJECT_0) {
             rdpgfx_server_handle_messages(ctx->gfx);
+        }
+    }
+
+    /* RDPEDISP shares the transport with GFX, audio and clipboard. Pump it
+     * under xportLock so monitor-layout callbacks are ordered with the surface
+     * reset they schedule. Do not depend on the per-channel event here: some
+     * reconnect/client combinations queue the one-shot Monitor Layout PDU
+     * without leaving that event signalled long enough for the outer wait set.
+     * A non-blocking read every 50 ms is cheap and makes the receive path
+     * deterministic. ERROR_NO_DATA simply means there is no layout this tick. */
+    if (ok && ctx->disp && ctx->dispCapsSent) {
+        UINT drc = disp_server_handle_messages(ctx->disp);
+        if (drc != CHANNEL_RC_OK && drc != ERROR_NO_DATA) {
+            rdp_error("MS-RDPEDISP message handling failed: %u", drc);
+            ok = false;
         }
     }
 
@@ -4128,6 +4277,10 @@ bool rdp_peer_send_progressive_frame(freerdp_peer *peer,
     RDPGFX_START_FRAME_PDU startFrame = { .frameId = fid };
     RDPGFX_END_FRAME_PDU endFrame = { .frameId = fid };
     const uint32_t qoeSlot = fid % RDP_QOE_SEND_HISTORY;
+    atomic_store_explicit(&ctx->frameAckTimesMS[qoeSlot], 0u,
+                          memory_order_relaxed);
+    atomic_store_explicit(&ctx->frameAckFrameIds[qoeSlot], 0u,
+                          memory_order_release);
     atomic_store_explicit(&ctx->qoeSendTimesMS[qoeSlot], GetTickCount64(),
                           memory_order_relaxed);
     atomic_store_explicit(&ctx->qoeSendSizes[qoeSlot], compressedLen,

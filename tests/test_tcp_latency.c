@@ -110,6 +110,30 @@ static void test_frame_ack_can_advance_past_stale_qoe(void) {
            1u);
 }
 
+static void test_mstsc_batched_qoe_prefers_exact_frame_ack(void) {
+    assert(rdp_tcp_latency_rate_feedback_ms(700u, 50u, true) == 50u);
+    assert(rdp_tcp_latency_rate_feedback_ms(700u, 0u, true) == 700u);
+    assert(rdp_tcp_latency_rate_feedback_ms(700u, 50u, false) == 700u);
+
+    RDPTCPLatencyController c;
+    rdp_tcp_latency_init(&c, 250000u, 7500000u, 0u);
+    assert(rdp_tcp_latency_apply_network(&c, 12294u, 43u, 1000u) ==
+           1152562u);
+    const uint32_t initial = c.currentBytesPerSec;
+
+    /* Model a long mstsc session: the exact-frame ACK remains healthy while
+     * every QoE report is batched by 700 ms. Only the selected transport
+     * sample enters the controller, so the target must never ratchet down. */
+    for (uint64_t i = 1u; i <= 3600u; i++) {
+        const uint32_t selected = rdp_tcp_latency_rate_feedback_ms(
+            700u, 50u, true);
+        RDPTCPLatencyAdjustment adjustment = rdp_tcp_latency_on_feedback(
+            &c, selected, 65536u, 0u, 0u, i, 1000u + i * 100u);
+        assert(adjustment != RDPTCPLatencyReduced);
+    }
+    assert(c.currentBytesPerSec >= initial);
+}
+
 static void test_bad_initial_sample_probes_up_and_rejects_safely(void) {
     RDPTCPLatencyController c;
     rdp_tcp_latency_init(&c, 250000u, 7500000u, 0u);
@@ -264,6 +288,7 @@ int main(void) {
     test_byte_inflight_budget_tracks_bdp();
     test_tiny_qoe_frames_get_a_byte_aware_safety_window();
     test_frame_ack_can_advance_past_stale_qoe();
+    test_mstsc_batched_qoe_prefers_exact_frame_ack();
     test_bad_initial_sample_probes_up_and_rejects_safely();
     test_large_frames_confirm_successful_probe();
     test_tiny_idle_feedback_cannot_stack_upward_probes();
